@@ -1,595 +1,662 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import os, re, sys, time, random, shutil
 
-import os, re, sys, time, json, requests, subprocess
-import urllib.request, urllib.parse, urllib.error
-from datetime import datetime
-from seleniumbase import SB
-
-# 环境变量配置(可以直接私库在双引号里填写)
-EMAIL         = os.environ.get("EMAIL") or ""           # 邮箱,只用于通知使用，可随意填写
-SESSION_TOKEN = os.environ.get("SESSION_TOKEN") or ""   # session token，默认登录方式,非必须
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or ""   # Discord Token 备用登录方式, 失败时才使用,必须填写
-GH_TOKEN      = os.environ.get("GH_TOKEN") or ""        # GitHub PAT token,用于自动更新session token,可选
-TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
-TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
-
-# 解析 DISCORD_TOKEN
-DC_TOKEN = ""
-if DISCORD_TOKEN:
-    _parts = DISCORD_TOKEN.split(",", 1)
-    DC_TOKEN = _parts[-1].strip()
-
-if not SESSION_TOKEN and not DC_TOKEN:
-    print("ℹ️ 未配置 SESSION_TOKEN 和 DISCORD_TOKEN,脚本终止。")
-    sys.exit(1)
-
-# 构造cookie
-COOKIES = {
-    "session_token": SESSION_TOKEN,
-    "login": "true",
-    "theme": "system",
-}
-
-# 记录本次登录方式（用于通知）
-_LOGIN_METHOD = "SESSION_TOKEN"
-
-# 获取cookie到期时间
-def get_cookie_info(sb, name):
-    cookies = sb.get_cookies()
-    for c in cookies:
-        if c.get('name') == name:
-            value = c.get('value')
-            expiry_ts = c.get('expiry')
-            expiry_dt = datetime.fromtimestamp(expiry_ts) if expiry_ts else None
-            return value, expiry_dt
-    return None, None
-
-# 检查是否需要更新cookie
-def should_update_cookie(new_value, old_value, expiry_dt, days_threshold=3):
-    if new_value is None:
-        return False
-    if new_value != old_value:
-        return True
-    if expiry_dt:
-        remaining = (expiry_dt - datetime.now()).total_seconds()
-        if remaining < days_threshold * 24 * 3600:
-            return True
-    return False
-
-# 更新cookie到secrets
-def update_github_secret(secret_name, new_value):
-    if not new_value:
-        print(f"⚠️ 跳过更新 {secret_name}：新值为空")
-        return False
-    masked = new_value[:4] + "..." + new_value[-4:] if len(new_value) > 8 else "***"
-    print(f"🔄 更新 Secret: {secret_name} (新值: {masked})")
-    try:
-        env = os.environ.copy()
-        if GH_TOKEN:
-            env["GH_TOKEN"] = GH_TOKEN
-        proc = subprocess.run(
-            ["gh", "secret", "set", secret_name, "--body", new_value],
-            capture_output=True, text=True, timeout=30, check=False,
-            env=env
-        )
-        if proc.returncode == 0:
-            return True
-        else:
-            print(f"❌ 更新失败: {proc.stderr.strip()}")
-            return False
-    except Exception as e:
-        print(f"❌ 异常: {e}")
-        return False
-
-# 发送tg通知
-def send_telegram_message(message: str):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("⚠️ Telegram 未配置，跳过通知")
+# ==================== 本地 .env 加载(不提交仓库) ====================
+def _load_local_env():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
         return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
-        print("✅ Telegram 通知已发送")
-    except Exception as e:
-        print(f"❌ Telegram 发送失败: {e}")
-
-# 通知格式
-def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "") -> str:
-    local_time = time.gmtime(time.time() + 8 * 3600)
-    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
-    if '@' in EMAIL:
-        name, domain = EMAIL.split('@', 1)
-        if len(name) > 4:
-            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            masked_email = f"{name}@{domain}"
-    else:
-        masked_email = EMAIL[:2] + '****' 
-    
-    lines = [
-        "🇫🇮 Bot-hosting 续期通知",
-        "",
-        f"{status}",
-        f"👤 登录账户: {masked_email}",
-    ]
-    if _LOGIN_METHOD != "SESSION_TOKEN":
-        lines.append(f"🔐 登录方式: {_LOGIN_METHOD}")
-    if expiry_date:
-        lines.append(f"📅 到期时间: {expiry_date}")
-    if extra:
-        lines.append(extra)
-    if error:
-        lines.append(f"⚠️ 错误信息: {error}")
-    lines.append(f"⏱️ 登录时间: {now}")
-    return "\n".join(lines)
-
-# 等待Turnstile验证通过
-def wait_for_turnstile_pass(sb, timeout=30):
-    start = time.time()
-    cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
-    while time.time() - start < timeout:
-        page_lower = sb.get_page_source().lower()
-        if not any(x in page_lower for x in cf_indicators):
-            print("✅ Turnstile 验证已通过")
-            # sb.save_screenshot("turnstile_passed.png")
-            return True
-        sb.sleep(1)
-    print("❌ Turnstile 验证超时未通过")
-    return False
-    
-# 获取当前出口ip
-def get_current_ip(proxy_server: str = "") -> str:
-    proxies = None
-    if proxy_server:
-        proxies = {"http": proxy_server, "https": proxy_server}
-    response = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-    response.raise_for_status()
-    return response.text.strip()
-
-# 时间格式化
-def format_countdown(countdown_str: str) -> str:
-    try:
-        h, m, _ = countdown_str.split(':')
-        h = int(h)
-        m = int(m)
-        if h > 0:
-            return f"{h}h{m}min"
-        else:
-            return f"{m}min"
-    except:
-        return countdown_str
-
-# 获取过期日期
-def extract_expiry_date(page_source: str) -> str:
-    patterns = [
-        r"[Ee]xpires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})",   # Expires 2026/07/07
-        r"[Ee]xpires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",   # Expires 07/07/2026 (MM/DD/YYYY)
-        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew",        # 2026/07/07 - renew
-        r"(\d{2}/\d{2}/\d{4})\s*[\-–]\s*renew",        # 07/07/2026 - renew
-        r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew manually to extend for 4 days", # 2026/07/07 - renew manually to extend for 4 days
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, page_source)
-        if match:
-            date_str = match.group(1)
-            # 如果是 MM/DD/YYYY 格式，转换为 YYYY/MM/DD
-            if len(date_str.split('/')[-1]) == 4:  # 年份长度4
-                parts = date_str.split('/')
-                if len(parts[0]) == 2:  # 第一部分是2位（月）
-                    # 修正：将 MM/DD/YYYY 转为 YYYY/MM/DD
-                    return f"{parts[2]}/{parts[0]}/{parts[1]}"
-            return date_str
-    return None
-
-#   Discord OAuth 登录（SESSION_TOKEN 失效时的备用方案）
-DISCORD_CLIENT_ID   = "884382422530158623"
-OAUTH_REDIRECT_URI  = "https://bot-hosting.net/login"
-OAUTH_SCOPE         = "identify email guilds"
-DISCORD_API         = "https://discord.com/api/v9/oauth2/authorize"
-DISCORD_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-)
-STATE_RE = re.compile(r"[?&]state=([^&]+)")
-
-
-def capture_discord_state(sb) -> str:
-    """打开 /login/discord，从落地页 URL 里提取本次会话的 state"""
-    print("🔎 获取 Discord OAuth state...")
-    sb.uc_open_with_reconnect("https://bot-hosting.net/login/discord", reconnect_time=4)
-    time.sleep(2)
-
-    url = sb.get_current_url()
-    if "discord.com" not in url:
-        print(f"⚠️ 未跳转到 Discord 相关页面，当前 URL：{url}")
-        return ""
-
-    m = STATE_RE.search(url)
-    if not m:
-        print(f"❌ 未能从 URL 中解析出 state，当前 URL：{url}")
-        return ""
-
-    state = urllib.parse.unquote(m.group(1))
-    print(f"✅ 已捕获 state（当前落地页：{urllib.parse.urlparse(url).path}）")
-    return state
-
-
-def discord_authorize(state: str) -> str:
-    """用 DC_TOKEN 直接完成 Discord 侧授权，返回跳转回 bot-hosting.net 的 location"""
-    query = urllib.parse.urlencode({
-        "client_id":     DISCORD_CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri":  OAUTH_REDIRECT_URI,
-        "scope":         OAUTH_SCOPE,
-        "state":         state,
-    })
-    authorize_url = f"{DISCORD_API}?{query}"
-
-    referer = (
-        "https://discord.com/oauth2/authorize?" +
-        urllib.parse.urlencode({
-            "client_id":     DISCORD_CLIENT_ID,
-            "redirect_uri":  OAUTH_REDIRECT_URI,
-            "response_type": "code",
-            "scope":         OAUTH_SCOPE,
-            "state":         state,
-        })
-    )
-
-    headers = {
-        "accept":           "*/*",
-        "authorization":    DC_TOKEN,
-        "content-type":     "application/json",
-        "origin":           "https://discord.com",
-        "referer":          referer,
-        "user-agent":       DISCORD_UA,
-        "x-discord-locale": "zh-CN",
-    }
-
-    body = json.dumps({
-        "permissions": "0",
-        "authorize": True,
-        "integration_type": 0,
-        "location_context": {
-            "guild_id": "10000",
-            "channel_id": "10000",
-            "channel_type": 10000,
-        },
-    })
-
-    # 如果配置了代理，Discord API 请求也走代理
-    proxies = None
-    _is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
-    _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
-    if _is_proxy:
-        proxies = {"http": _proxy_server, "https": _proxy_server}
-
-    try:
-        resp = requests.post(authorize_url, headers=headers, data=body, proxies=proxies, timeout=20)
-        if resp.status_code != 200:
-            print(f"❌ Discord OAuth2 授权失败: HTTP {resp.status_code} - {resp.text[:300]}")
-            return ""
-        resp_data = resp.json()
-    except Exception as e:
-        print(f"❌ Discord OAuth2 授权异常: {e}")
-        return ""
-
-    location = resp_data.get("location", "")
-    if not location:
-        print(f"❌ 授权响应中未找到 location 字段: {resp_data}")
-        return ""
-
-    masked = re.sub(r"code=[^&]+", "code=***", location)
-    print(f"✅ 拿到回调 URL: {masked}")
-    return location
-
-
-def do_discord_login(sb) -> bool:
-    """通过 Discord Token 走完整 OAuth 流程登录 bot-hosting.net"""
-    print("\n🔑 通过 Discord Token 登录...")
-
-    state = capture_discord_state(sb)
-    if not state:
-        sb.save_screenshot("login_no_state.png")
-        return False
-
-    location = discord_authorize(state)
-    if not location:
-        return False
-
-    print("↩️ 携带授权码打开回调链接...")
-    sb.uc_open_with_reconnect(location, reconnect_time=4)
-    time.sleep(3)
-
-    url = sb.get_current_url()
-
-    if "/error/banned" in url:
-        print("🚫 账号已被封禁")
-        sb.save_screenshot("login_banned.png")
-        return False
-
-    if "bot-hosting.net" not in url:
-        print(f"❌ 回调后未跳转至 bot-hosting.net，当前 URL：{url}")
-        sb.save_screenshot("login_no_redirect.png")
-        return False
-
-    try:
-        body_text = sb.get_text("body")
-    except Exception:
-        body_text = ""
-    if "fraud" in body_text.lower():
-        print("🚫 触发风控（fraud attempt），可能是 IP 被拦截")
-        sb.save_screenshot("login_fraud.png")
-        return False
-
-    for _ in range(30):
-        url = sb.get_current_url()
-        path = urllib.parse.urlparse(url).path
-        if "bot-hosting.net" in url and path != "/login" and not path.startswith("/login/discord"):
-            print(f"✅ Discord OAuth 登录成功！当前页面：{url}")
-            return True
-        time.sleep(0.5)
-
-    print(f"❌ 登录超时或未跳转成功，最终停留在：{url}")
-    try:
-        body_text = sb.get_text("body")
-        print(f"📄 页面正文片段：{body_text[:200].strip()!r}")
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and v and not os.environ.get(k):
+                    os.environ[k] = v
     except Exception:
         pass
-    sb.save_screenshot("login_timeout.png")
+
+_load_local_env()
+
+# ==================== CONFIG ====================
+EMAIL        = os.environ.get('BOT_HOSTING_EMAIL') or os.environ.get('EMAIL') or ""
+PASSWORD     = os.environ.get('BOT_HOSTING_PASSWORD') or os.environ.get('PASSWORD') or ""
+TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""
+TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""
+IS_PROXY     = os.environ.get('IS_PROXY', 'false').lower() == 'true'
+PROXY_SERVER = (os.environ.get('PROXY_SERVER') or "http://127.0.0.1:1081").strip()
+BROWSER_CHANNEL = os.environ.get('BROWSER_CHANNEL') or ""
+SECURITY_TIMEOUT = int(os.environ.get('SECURITY_TIMEOUT') or "240")
+
+REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
+
+BASE_URL = "https://bot-hosting.net"
+LOGIN_URL = f"{BASE_URL}/login"
+BILLINGS_URL = f"{BASE_URL}/a/billings"
+
+try:
+    from patchright.sync_api import sync_playwright
+    USING_PATCHRIGHT = True
+except ImportError:
+    from playwright.sync_api import sync_playwright
+    USING_PATCHRIGHT = False
+
+import requests
+
+# ==================== 常量 ====================
+CF_IFRAME_SELECTOR = 'iframe[src*="challenges.cloudflare.com"]'
+SECURITY_TITLE_HINTS = ('security verification', 'just a moment', 'attention required',
+                        'checking your browser', 'one more step')
+DEFAULT_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
+
+# 到期日: "2026/10/28 到期" / "2026-10-28" / "2026年10月28日"
+DUE_DATE_RES = [
+    re.compile(r'(\d{4}/\d{1,2}/\d{1,2})\s*到期'),
+    re.compile(r'(\d{4}[/-]\d{1,2}[/-]\d{1,2})'),
+    re.compile(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日'),
+]
+# 续期按钮(中/英界面)
+RENEW_OPEN_TEXTS = ["续期免费套餐", "Renew free plan", "Renew free"]
+RENEW_CONFIRM_TEXTS = ["续期 4 天", "Renew 4 days", "续期4天"]
+# 冷却期按钮文案: "23:53:05 后可续期" / "Renew available in 5h" / "X 后可续期"
+COOLDOWN_RE = re.compile(r'(\d{1,2}[:：]\d{2}[:：]\d{2}|\d+\s*(?:小时|分钟|秒|h|m|s))\s*(?:后)?'
+                         r'(?:可续期|可再次续期|后可以续期|until renew|before renew)', re.IGNORECASE)
+COOLDOWN_HINT_RE = re.compile(r'(\d{1,2}[:：]\d{2}[:：]\d{2})\s*后可续期')
+# 未到续期/已达上限等提示
+NOT_NOW_RE = re.compile(r"(已续期|无法续期|还不能续期|稍后再试|已达到|冷却|too early|already renewed|"
+                        r"can'?t renew|cannot renew|not yet|后可续期)", re.IGNORECASE)
+
+def log(message):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+
+def _parse_due(text):
+    for i, rx in enumerate(DUE_DATE_RES):
+        m = rx.search(text)
+        if m:
+            if i == 2:
+                return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+            return m.group(1)
+    return None
+
+# ==================== IP / 通知 ====================
+def get_current_ip():
+    try:
+        r = requests.get("https://api.ip.sb/ip", proxies=REQUESTS_PROXIES, timeout=15)
+        if r.status_code == 200:
+            return r.text.strip()
+    except Exception as e:
+        log(f"获取出口IP失败: {e}")
+    return "获取失败"
+
+def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("Telegram 未配置，跳过通知")
+        return
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + 8 * 3600))
+    if '@' in EMAIL:
+        name, domain = EMAIL.split('@', 1)
+        masked = f"{name[:2]}****{name[-2:]}@{domain}" if len(name) > 4 else f"{name}@{domain}"
+    else:
+        masked = EMAIL[:2] + '****'
+    text = (
+        f"Bot-Hosting 续期通知\n\n"
+        f"{status}\n"
+        f"账号: {masked}\n"
+        f"续期前到期: {old_due}\n"
+        f"续期后到期: {new_due}\n"
+        f"使用IP: {current_ip}\n"
+        f"时间: {now}"
+    )
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                          json={"chat_id": TG_CHAT_ID, "text": text},
+                          timeout=10, proxies=REQUESTS_PROXIES)
+        if r.status_code == 200:
+            log("Telegram 通知发送成功")
+        else:
+            log(f"Telegram 通知失败: {r.text}")
+    except Exception as e:
+        log(f"Telegram 通知异常: {e}")
+
+# ==================== Cloudflare 过盾 ====================
+def _has_interstitial_iframe(page):
+    try:
+        for h in page.query_selector_all(CF_IFRAME_SELECTOR):
+            if '/turnstile/' not in (h.get_attribute('src') or ''):
+                return True
+    except Exception:
+        pass
     return False
 
+def _is_security_check_page(page):
+    try:
+        title = (page.title() or '').lower()
+        if any(h in title for h in SECURITY_TITLE_HINTS):
+            return True
+    except Exception:
+        return True
+    try:
+        return page.evaluate("""() => {
+            const t = document.body ? document.body.innerText.slice(0,5000).toLowerCase() : '';
+            return t.includes('verify you are human') || t.includes('checking your browser')
+                || t.includes('security verification');
+        }""")
+    except Exception:
+        return True
 
-# 主流程
-def main():
-    print("#" * 25)
-    print("   Bot-hosting 自动续期")
-    print("#" * 25)
+def _find_visible_cf_frames(page):
+    out = []
+    try:
+        for h in page.query_selector_all(CF_IFRAME_SELECTOR):
+            try:
+                b = h.bounding_box()
+                if b and b['width'] > 10 and b['height'] > 10:
+                    out.append(h)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
 
-    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-    PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
-    HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
-
-    sb_kwargs = {"uc": True, "headless": HEADLESS}
-
-    if IS_PROXY:
-        print(f"🔗 挂载代理: {PROXY_SERVER}")
-        sb_kwargs["proxy"] = PROXY_SERVER
-    else:
-        print("🍭 未使用代理，直连访问")
-
-    global _LOGIN_METHOD
-
-    with SB(**sb_kwargs) as sb:
+def _click_cf_checkbox(page, frame_el=None):
+    for frame in page.frames:
+        if 'challenges.cloudflare.com' not in (frame.url or ''):
+            continue
         try:
-            ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
-            print(f"📍 当前出口IP: {ip}")
+            frame.locator('input[type="checkbox"]').first.click(timeout=2500)
+            return True
+        except Exception:
+            continue
+    if frame_el is None:
+        return False
+    try:
+        frame_el.scroll_into_view_if_needed(timeout=3000)
+        box = frame_el.bounding_box()
+        if not box:
+            return False
+        x = box['x'] + random.uniform(18, 34)
+        y = box['y'] + box['height'] / 2 + random.uniform(-4, 4)
+        page.mouse.move(x - random.uniform(30, 60), y + random.uniform(-8, 8))
+        time.sleep(random.uniform(0.15, 0.4))
+        page.mouse.move(x, y)
+        time.sleep(random.uniform(0.05, 0.2))
+        page.mouse.down()
+        time.sleep(random.uniform(0.04, 0.1))
+        page.mouse.up()
+        return True
+    except Exception:
+        return False
+
+def _get_turnstile_token(page):
+    try:
+        return page.evaluate("""() => {
+            if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                let t = null;
+                try { t = window.turnstile.getResponse(); } catch(e) {}
+                if (t && t.length > 30) return t;
+                for (let i = 0; i < 5; i++) {
+                    try { t = window.turnstile.getResponse(String(i)); } catch(e) { t = null; }
+                    if (t && t.length > 30) return t;
+                }
+            }
+            const inp = document.querySelector('input[name="cf-turnstile-response"]');
+            if (inp && inp.value && inp.value.length > 30) return inp.value;
+            return null;
+        }""")
+    except Exception:
+        return None
+
+def handle_cloudflare(page, timeout=None):
+    if timeout is None:
+        timeout = SECURITY_TIMEOUT
+    def active():
+        return _has_interstitial_iframe(page) or _is_security_check_page(page)
+    if not active():
+        return True
+    log("检测到 Cloudflare 安全验证...")
+    time.sleep(3)
+    start = time.time()
+    last_click = 0
+    clear = 0
+    while time.time() - start < timeout:
+        if not active():
+            clear += 1
+            if clear >= 2:
+                return True
+            time.sleep(1)
+            continue
+        clear = 0
+        if time.time() - last_click > 6:
+            frames = _find_visible_cf_frames(page)
+            if frames:
+                log("点击 Turnstile 验证...")
+                if _click_cf_checkbox(page, frames[-1]):
+                    last_click = time.time()
+                    time.sleep(random.uniform(2, 4))
+                    continue
+        time.sleep(1)
+    log("CF 验证超时")
+    return False
+
+def solve_turnstile(page, timeout=90):
+    """处理页面内嵌 Turnstile(登录表单 / 续期弹窗共用)"""
+    if _get_turnstile_token(page):
+        return True
+    frames = _find_visible_cf_frames(page)
+    if not frames:
+        time.sleep(2)
+        if _get_turnstile_token(page) or not _find_visible_cf_frames(page):
+            return True
+    log("处理 Turnstile 人机验证...")
+    start = time.time()
+    last_click = 0
+    clicks = 0
+    while time.time() - start < timeout:
+        if _get_turnstile_token(page):
+            log("Turnstile 验证通过")
+            return True
+        frames = _find_visible_cf_frames(page)
+        if not frames:
+            break
+        if time.time() - last_click > 5:
+            log(f"点击 Turnstile 复选框 (第 {clicks + 1} 次)...")
+            if _click_cf_checkbox(page, frames[-1]):
+                clicks += 1
+                last_click = time.time()
+                time.sleep(random.uniform(2, 4))
+                continue
+        time.sleep(1)
+    tok = bool(_get_turnstile_token(page))
+    log("Turnstile 验证通过" if tok else "Turnstile 未确认通过")
+    return tok
+
+# ==================== 浏览器 ====================
+def _detect_channel():
+    if BROWSER_CHANNEL:
+        return BROWSER_CHANNEL
+    if sys.platform == 'win32':
+        for ch, paths in {
+            'msedge': [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                       r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"],
+            'chrome': [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                       r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"],
+        }.items():
+            if any(os.path.exists(p) for p in paths):
+                return ch
+        return None
+    if shutil.which("google-chrome") or shutil.which("google-chrome-stable"):
+        return "chrome"
+    if shutil.which("microsoft-edge"):
+        return "msedge"
+    return "chrome"
+
+def open_browser(p):
+    proxy_arg = {"server": PROXY_SERVER} if IS_PROXY else None
+    channel = _detect_channel()
+    if USING_PATCHRIGHT and channel:
+        try:
+            browser = p.chromium.launch(channel=channel, headless=False,
+                                        args=['--disable-infobars'], proxy=proxy_arg)
+            ctx = browser.new_context(viewport={'width': 1440, 'height': 900}, proxy=proxy_arg)
+            log(f"启动反检测浏览器 (patchright + {channel})")
+            return browser, ctx.new_page()
         except Exception as e:
-            print(f"⚠️ 获取出口 IP 失败: {e}")
+            log(f"patchright 启动失败: {e}")
+    log("使用内置 chromium (过 CF 能力较弱)")
+    browser = p.chromium.launch(headless=False,
+        args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars'])
+    ctx = browser.new_context(viewport={'width': 1440, 'height': 900},
+                              user_agent=DEFAULT_UA, proxy=proxy_arg)
+    page = ctx.new_page()
+    page.add_init_script("try { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); } catch(e) {}")
+    return browser, page
 
-        login_ok = False
+# ==================== 登录(两步: 邮箱 -> 密码+Turnstile) ====================
+def login(page):
+    if not EMAIL or not PASSWORD:
+        log("缺少登录凭证 (BOT_HOSTING_EMAIL/BOT_HOSTING_PASSWORD)")
+        return False
+    try:
+        log("打开登录页...")
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page)
+        time.sleep(3)
 
-        # 方式1: SESSION_TOKEN Cookie 登录（默认）
-        if SESSION_TOKEN:
-            print("🚀 启动浏览器...")
-            sb.open("https://bot-hosting.net/")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(2)
+        # 步骤1: 填邮箱, 点 "Continue with email"
+        log("步骤1: 提交邮箱...")
+        email_in = page.locator('input[type="email"], input#email').first
+        email_in.wait_for(state="visible", timeout=30000)
+        email_in.fill(EMAIL, timeout=10000)
+        time.sleep(0.8)
 
-            print("📝 注入 Cookie...")
-            for name, value in COOKIES.items():
-                if value:
-                    sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
-
-            print("🌐 访问 https://bot-hosting.net/a/billings ...")
-            sb.open("https://bot-hosting.net/a/billings")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(3)
-            current_url = sb.get_current_url()
-            current_title = sb.get_title()
-            print(f"📝 当前URL: {current_url}, Title: {current_title}")
-
-            if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
-                login_ok = True
-                print("✅ SESSION_TOKEN 登录成功, 当前已到达账单页")
-            else:
-                print(f"❌ SESSION_TOKEN 登录失败，当前URL: {current_url}, 当前标题: {current_title}")
-
-        # 方式2: Discord OAuth 登录（备用）
-        if not login_ok and DC_TOKEN:
-            _LOGIN_METHOD = "Discord Token"
-            print("\n🔄 SESSION_TOKEN 登录失败或未配置，尝试 Discord OAuth 登录...")
-            if do_discord_login(sb):
-                print("🌐 访问 https://bot-hosting.net/a/billings ...")
-                sb.open("https://bot-hosting.net/a/billings")
-                sb.wait_for_ready_state_complete()
-                sb.sleep(3)
-                current_url = sb.get_current_url()
-                current_title = sb.get_title()
-                print(f"📝 当前URL: {current_url}, Title: {current_title}")
-
-                if "a/billings" in current_url:
-                    login_ok = True
-                    print("✅ Discord OAuth 登录成功,当前已到达账单页")
-                else:
-                    print(f"❌ Discord OAuth 登录后仍未到达账单页，当前URL: {current_url}")
-            else:
-                print("❌ Discord OAuth 登录失败")
-
-        if not login_ok:
-            error_msg = "Cookie 已失效或页面异常"
-            if not SESSION_TOKEN and DC_TOKEN:
-                error_msg = "Discord OAuth 登录失败"
-            elif SESSION_TOKEN and DC_TOKEN:
-                error_msg = "SESSION_TOKEN 和 Discord OAuth 均失败"
-            send_telegram_message(format_notification("❌ 登录失败", error=error_msg))
-            return
-
-        if _LOGIN_METHOD == "Discord Token":
-            print("ℹ️ 本次使用 Discord OAuth 登录，新的 SESSION_TOKEN 将自动更新到 Secrets")
-
-        # 提取当前到期日期
-        sb.sleep(2)
-        page_source = sb.get_page_source()
-        current_expiry = extract_expiry_date(page_source)
-        if current_expiry:
-            print(f"📅 当前到期日期: {current_expiry}")
-        else:
-            print("⚠️ 未能提取当前到期日期")
-
-        # 寻找外部续期按钮
-        outer_renew_selector = None
-        countdown_text = None
-        possible_selectors = [
-            'button:contains("Renew")',
-            'button:contains("Renew free plan")',
-            'a:contains("Renew")',
-            '[class*="renew"]',
-            '[class*="Renew"]',
-        ]
-
-        for selector in possible_selectors:
+        clicked = False
+        for t in ("Continue with email", "使用邮箱继续", "Continue"):
             try:
-                if sb.is_element_visible(selector):
-                    button_text = sb.get_text(selector)
-                    if "Renew in" in button_text:
-                        match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", button_text)
-                        if match:
-                            countdown_text = match.group(1)
-                        break
-                    elif "Renew" in button_text and "in" not in button_text.lower():
-                        outer_renew_selector = selector
-                        print(f"✅ 续期按钮可用: '{button_text}'")
-                        break
-            except Exception as e:
-                pass
-
-        # 点击外部续期按钮等待弹窗
-        if outer_renew_selector:
-            print("🔄 点击外部续期按钮，等待验证窗口...")
-            try:
-                sb.sleep(2)
-                sb.click(outer_renew_selector)
-                sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
-            except Exception as e:
-                print(f"❌ 点击外部按钮失败: {e}")
-                send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
-                return
-
-            # 处理弹窗中的 Turnstile
-            print("🔒 检测弹窗中的 Turnstile 验证...")
-            turnstile_passed = False
-            for attempt in range(1, 4):
-                try:
-                    sb.uc_gui_click_captcha()
-                    time.sleep(12)
-                except Exception as e:
-                    print(f"⚠️ 点击 Turnstile 出错: {e}")
-
-                if wait_for_turnstile_pass(sb, timeout=20):
-                    turnstile_passed = True
+                b = page.locator(f'button:has-text("{t}")').first
+                if b.count() > 0:
+                    b.click(timeout=8000)
+                    clicked = True
                     break
-                else:
-                    print(f"⏳ 第 {attempt} 次未通过，重试点击...")
+            except Exception:
+                continue
+        if not clicked:
+            email_in.press("Enter")
+        time.sleep(4)
+        handle_cloudflare(page, timeout=60)
 
-            if not turnstile_passed:
-                print("❌ Turnstile 验证最终未通过，脚本退出")
-                send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
-                return
+        # 步骤2: 填密码 + Turnstile
+        log("步骤2: 提交密码...")
+        pwd_in = page.locator('input[type="password"]').first
+        pwd_in.wait_for(state="visible", timeout=30000)
+        pwd_in.fill(PASSWORD, timeout=10000)
+        time.sleep(0.6)
+        solve_turnstile(page, timeout=90)
 
-            # 点击续期按钮
-            print("⏳ 等待续期按钮可用并点击...")
-            time.sleep(5) 
-
-            modal_button_clicked = False
+        log("点击登录...")
+        submitted = False
+        for sel in ('button:has-text("Sign in")', 'button:has-text("登录")',
+                    'button[type="submit"]'):
             try:
-                selector = 'div[role="dialog"] button.btn-primary' 
-                sb.click(selector, timeout=8)
-                modal_button_clicked = True
-                print("✅ 已点击续期按钮")
-            except Exception as e:
-                print(f"续期按钮点击失败: {e}")
+                b = page.locator(sel).first
+                if b.count() > 0:
+                    b.click(timeout=8000)
+                    submitted = True
+                    break
+            except Exception:
+                continue
+        if not submitted:
+            pwd_in.press("Enter")
 
-            print("⏳ 等待新的过期时间...")
-            sb.sleep(6)
+        time.sleep(6)
+        handle_cloudflare(page)
+        start = time.time()
+        while time.time() - start < 90:
+            u = (page.url or '').lower()
+            if '/login' not in u and 'signin' not in u:
+                log(f"登录成功: {page.url}")
+                return True
+            handle_cloudflare(page, timeout=10)
+            time.sleep(1)
 
-            # 提取新的到期日期和倒计时
-            new_page_text = sb.get_page_source()
-            new_expiry = extract_expiry_date(new_page_text)
-            new_match = re.search(r"Renewal cooldown (\d{2}:\d{2}:\d{2})", new_page_text)
-            if new_match:
-                new_countdown = new_match.group(1)
-                print(f"✅ 续期成功！新的倒计时: {new_countdown}")
-                if new_expiry:
-                    print(f"📅 新的到期日期: {new_expiry}")
-                send_telegram_message(
-                    format_notification(
-                        "✅ 续期成功",
-                        extra=f"⏱️ 可续期时间: {format_countdown(new_countdown)}后",
-                        expiry_date=new_expiry or "（未获取到）"
-                    )
-                )
+        # 失败: 记录原因
+        msgs = page.evaluate(
+            "() => Array.from(document.querySelectorAll('.alert,[role=alert]')).map(m => (m.innerText||'').trim())"
+        )
+        log(f"登录失败, 页面提示: {msgs}")
+        page.screenshot(path="login_fail.png")
+        return False
+    except Exception as e:
+        log(f"登录异常: {e}")
+        try:
+            page.screenshot(path="login_fail.png")
+        except Exception:
+            pass
+        return False
+
+# ==================== 到期时间 ====================
+def get_due_date(page):
+    try:
+        text = page.locator("body").inner_text()
+        due = _parse_due(text)
+        if due:
+            return due
+    except Exception as e:
+        log(f"读取到期时间异常: {e}")
+    return "未知"
+
+def _read_due_with_retry(page, old_due, retries=4):
+    new_due = old_due
+    for i in range(retries):
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+            handle_cloudflare(page)
+            time.sleep(3)
+        except Exception:
+            pass
+        new_due = get_due_date(page)
+        if new_due != old_due:
+            break
+        if i < retries - 1:
+            log("到期时间尚未刷新，4 秒后重试...")
+            time.sleep(4)
+    return new_due
+
+# ==================== 续期 ====================
+def _visible_messages(page):
+    try:
+        return page.evaluate("""() => {
+            const out = [];
+            document.querySelectorAll('[role="dialog"], [role="alert"], .alert, .toast, [data-sonner-toast]')
+                .forEach(m => {
+                    const r = m.getBoundingClientRect();
+                    const t = (m.innerText||'').trim();
+                    if (t && r.width > 0 && r.height > 0) out.push(t);
+                });
+            return out;
+        }""")
+    except Exception:
+        return []
+
+def _detect_cooldown(page):
+    """检测续期冷却期。免费套餐续期有间隔限制, 冷却中按钮显示 'X 后可续期' 且禁用。
+    返回冷却剩余时间文本, 否则返回空串"""
+    try:
+        info = page.evaluate("""() => {
+            const out = {texts: []};
+            document.querySelectorAll('button').forEach(b => {
+                const t = (b.innerText||'').trim();
+                if (t && b.disabled) out.texts.push(t);
+            });
+            out.body = document.body ? document.body.innerText.slice(0, 4000) : '';
+            return out;
+        }""")
+        for t in info.get("texts", []):
+            m = COOLDOWN_HINT_RE.search(t)
+            if m:
+                return m.group(1)
+        m = COOLDOWN_HINT_RE.search(info.get("body", ""))
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+def _click_text(page, texts, timeout=10000, wait_rounds=20):
+    """点击首个可用且可见的按钮; 支持等 SPA 渲染。wait_rounds=0 表示不等待"""
+    for t in texts:
+        try:
+            loc = page.locator(f'button:has-text("{t}")')
+            for _ in range(wait_rounds):
+                if loc.count() > 0:
+                    break
+                time.sleep(1)
+            if loc.count() == 0:
+                continue
+            btn = loc.first
+            btn.wait_for(state="visible", timeout=8000)
+            try:
+                if btn.is_disabled():
+                    continue
+            except Exception:
+                pass
+            btn.scroll_into_view_if_needed()
+            btn.click(timeout=timeout)
+            return t
+        except Exception:
+            continue
+    return None
+
+def _dump_buttons(page):
+    try:
+        btns = page.evaluate("""() => Array.from(document.querySelectorAll('button'))
+            .map(b => ({t: (b.innerText||'').trim().slice(0,40), d: b.disabled}))
+            .filter(x => x.t)""")
+        desc = [(b["t"] + ("(禁用)" if b["d"] else "")) for b in btns][:30]
+        log(f"页面按钮: {desc}")
+    except Exception:
+        pass
+
+def renew_plan(page):
+    """打开续期弹窗 -> 过 Turnstile -> 点确认续期。返回 (结果, 旧到期, 新到期)"""
+    try:
+        log("进入续期流程...")
+        # 必须确保在账单页(续期按钮只在 /a/billings 出现)
+        if 'billings' not in (page.url or ''):
+            page.goto(BILLINGS_URL, wait_until="domcontentloaded", timeout=60000)
+            handle_cloudflare(page)
+            time.sleep(4)
+        log(f"当前页面: {page.url}")
+
+        old_due = get_due_date(page)
+        log(f"续期前到期: {old_due}")
+
+        # 先判冷却期(续期有间隔限制, 冷却中按钮文案是动态倒计时, 不可能匹配到)
+        cd = _detect_cooldown(page)
+        if cd:
+            log(f"处于续期冷却期，剩余 {cd}")
+            return "COOLDOWN", old_due, old_due, cd
+
+        # 打开续期弹窗(先等 SPA 渲染, 最多 15 秒)
+        log("点击『续期免费套餐』...")
+        opened = _click_text(page, RENEW_OPEN_TEXTS, wait_rounds=15)
+        if opened is None:
+            # 可能处于冷却期: 按钮文案为 "23:53:05 后可续期"(禁用)
+            cd = _detect_cooldown(page)
+            if cd:
+                log(f"处于续期冷却期: {cd}")
+                _dump_buttons(page)
+                return "COOLDOWN", old_due, old_due, cd
+            log("未找到续期按钮(可能是付费套餐或界面变化)")
+            _dump_buttons(page)
+            page.screenshot(path="renew_no_button.png")
+            return "NOT_TIME", old_due, old_due, ""
+        log(f"已点击: {opened}")
+        time.sleep(4)
+
+        # 弹窗内人机验证
+        log("弹窗内 Turnstile 验证...")
+        if not solve_turnstile(page, timeout=90):
+            log("Turnstile 未通过，尝试继续(按钮可能已解锁)")
+        time.sleep(2)
+
+        # 确认按钮解锁后再点
+        confirm = None
+        for i in range(6):
+            for t in RENEW_CONFIRM_TEXTS:
+                loc = page.locator(f'button:has-text("{t}")')
+                if loc.count() > 0 and not loc.first.is_disabled():
+                    confirm = loc.first
+                    log(f"确认按钮已解锁: {t}")
+                    break
+            if confirm:
+                break
+            log("确认按钮仍禁用，重新过验证...")
+            solve_turnstile(page, timeout=45)
+            time.sleep(3)
+
+        if confirm is None:
+            msgs = _visible_messages(page)
+            log(f"确认按钮不可用，页面提示: {msgs}")
+            page.screenshot(path="renew_captcha_fail.png")
+            return False, old_due, old_due, ""
+
+        log("点击确认续期...")
+        confirm.scroll_into_view_if_needed()
+        confirm.click(timeout=10000)
+        time.sleep(6)
+
+        # 结果: 到期日变化为准
+        new_due = get_due_date(page)
+        if new_due == old_due:
+            new_due = _read_due_with_retry(page, old_due)
+
+        msgs = _visible_messages(page)
+        if msgs:
+            log(f"页面提示: {msgs}")
+        if any(NOT_NOW_RE.search(m) for m in msgs) and new_due == old_due:
+            cd = _detect_cooldown(page)
+            if cd:
+                log(f"处于续期冷却期: {cd}")
+                return "COOLDOWN", old_due, old_due, cd
+            log("未到续期时间")
+            return "NOT_TIME", old_due, old_due, ""
+
+        if new_due != old_due and new_due != "未知":
+            log(f"续期成功! 到期 {old_due} -> {new_due}")
+            return True, old_due, new_due, ""
+
+        log(f"到期时间未变化: {old_due}")
+        page.screenshot(path="renew_no_change.png")
+        return False, old_due, new_due, ""
+    except Exception as e:
+        log(f"续期异常: {e}")
+        try:
+            page.screenshot(path="renew_error.png")
+        except Exception:
+            pass
+        return False, "未知", "未知", ""
+
+# ==================== 主流程 ====================
+def main():
+    log(f"凭证检测: EMAIL={'已配置' if EMAIL else '未配置'}, PASSWORD={'已配置' if PASSWORD else '未配置'}")
+    if not EMAIL or not PASSWORD:
+        log("缺少登录凭证，退出")
+        sys.exit(1)
+
+    with sync_playwright() as p:
+        browser = None
+        try:
+            if IS_PROXY:
+                log(f"代理已启用: {PROXY_SERVER}")
+            current_ip = get_current_ip()
+            log(f"当前出口IP: {current_ip}")
+
+            browser, page = open_browser(p)
+            page.set_default_timeout(15000)
+
+            if current_ip == "获取失败":
+                try:
+                    page.goto("https://api.ip.sb/ip", wait_until="domcontentloaded", timeout=20000)
+                    t = page.locator("body").inner_text().strip()
+                    if t and len(t) < 50:
+                        current_ip = t
+                        log(f"当前出口IP(浏览器): {current_ip}")
+                except Exception:
+                    pass
+
+            if not login(page):
+                send_telegram_notification("登录失败", "-", "-", current_ip)
+                sys.exit(1)
+
+            result, old_due, new_due, cooldown = renew_plan(page)
+
+            if result == "COOLDOWN":
+                status = f"冷却期中（剩余 {cooldown}）"
+            elif result == "NOT_TIME":
+                status = "未到续期时间"
+            elif result is True:
+                status = "续期成功"
             else:
-                if new_expiry and new_expiry != current_expiry:
-                    print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
-                    send_telegram_message(
-                        format_notification(
-                            "✅ 续期成功",
-                            extra="到期日期已更新",
-                            expiry_date=new_expiry
-                        )
-                    )
-                else:
-                    print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
-                    send_telegram_message(
-                        format_notification(
-                            "⚠️ 续期可能未成功",
-                            extra="请登录后台检查",
-                            expiry_date=current_expiry or "（未获取到）"
-                        )
-                    )
+                status = "续期失败"
+            log(f"结论: {status} ({old_due} -> {new_due})")
 
-        else:
-            if countdown_text:
-                friendly = format_countdown(countdown_text)
-                print(f"⏳ 未到续期时间，倒计时: {countdown_text} ({friendly})")
-                send_telegram_message(
-                    format_notification(
-                        "⏳ 未到续期时间",
-                        extra=f"⏱️ 可续期时间: {friendly}后",
-                        expiry_date=current_expiry or "（未获取到）"
-                    )
-                )
-            else:
-                print("ℹ️ 未找到续期按钮或倒计时，状态未知")
-                send_telegram_message(
-                    format_notification(
-                        "ℹ️ 无需续期",
-                        extra="当前状态未知，请手动检查",
-                        expiry_date=current_expiry or "（未获取到）"
-                    )
-                )
-
-        # 更新SESSION_TOKEN 
-        print("🔄 检查 SESSION_TOKEN 是否需要更新")
-        new_token, token_expiry = get_cookie_info(sb, "session_token")
-        old_token = SESSION_TOKEN
-
-        if should_update_cookie(new_token, old_token, token_expiry):
-            print("🔄 SESSION_TOKEN 需要更新")
-            if GH_TOKEN:
-                if update_github_secret("SESSION_TOKEN", new_token):
-                    print("✅ SESSION_TOKEN 更新成功")
-                else:
-                    print("⚠️ 更新失败，请检查 GH_TOKEN 权限")
-            else:
-                print("⚠️ 未设置 GH_TOKEN，无法自动更新")
-                print(f"📋 请手动设置 SESSION_TOKEN = {new_token[:4]}...{new_token[-4:]}")
-        else:
-            print("✅ SESSION_TOKEN 无需更新")
-        
-        print("🏁 脚本执行完毕")
+            send_telegram_notification(status, old_due, new_due, current_ip)
+            # 冷却期属于正常等待状态, 不算失败
+            sys.exit(0 if result is True or result in ("NOT_TIME", "COOLDOWN") else 1)
+        except Exception as e:
+            log(f"运行出错: {e}")
+            sys.exit(1)
+        finally:
+            if browser:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     main()
