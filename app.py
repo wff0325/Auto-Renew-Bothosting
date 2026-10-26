@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+
 import os, re, sys, time, random, shutil
 
 # ==================== 本地 .env 加载(不提交仓库) ====================
@@ -31,7 +32,6 @@ TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""
 IS_PROXY     = os.environ.get('IS_PROXY', 'false').lower() == 'true'
 PROXY_SERVER = (os.environ.get('PROXY_SERVER') or "http://127.0.0.1:1081").strip()
 BROWSER_CHANNEL = os.environ.get('BROWSER_CHANNEL') or ""
-BROWSER_LOCALE = os.environ.get('BROWSER_LOCALE') or "zh-CN"   # 固定界面语言, 避免 Actions(英文) 与本地(中文) 差异
 SECURITY_TIMEOUT = int(os.environ.get('SECURITY_TIMEOUT') or "240")
 
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
@@ -58,24 +58,35 @@ DEFAULT_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 
 # 到期日(兼容中英文界面多种写法):
 #   中文面板: "2026/10/28 到期" / "2026年10月28日"
-#   英文面板: "Expires 10/28/2026" / "Expires on Oct 28, 2026" / "2026-10-28"
-#   注意: 美式是 月/日/年, 中式是 年/月/日, 需分别解析
+#   英文面板: "Expires 10/28/2026"(月/日/年) / "Expires on Oct 28, 2026" / "2026-10-28"
 DUE_DATE_RES = [
-    # 带明确前缀的英文/中文标签
     re.compile(r'(?:expires?(?:\s+on)?|renew(?:al)?\s+date|due(?:\s+on)?|到期(?:时间|日)?)\s*:?\s*'
                r'([A-Z][a-z]{2,8}\.?\s+\d{1,2},?\s+\d{4})', re.IGNORECASE),
     re.compile(r'(?:expires?(?:\s+on)?|renew(?:al)?\s+date|due(?:\s+on)?)\s*:?\s*'
                r'(\d{1,2}/\d{1,2}/\d{4})', re.IGNORECASE),
     re.compile(r'(?:expires?(?:\s+on)?|renew(?:al)?\s+date|due(?:\s+on)?)\s*:?\s*'
                r'(\d{4}-\d{1,2}-\d{1,2})', re.IGNORECASE),
-    # 中文面板: 年/月/日 或 年月日
     re.compile(r'(\d{4}/\d{1,2}/\d{1,2})\s*到期'),
     re.compile(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日'),
-    # 无前缀兜底
     re.compile(r'(\d{4}/\d{1,2}/\d{1,2})'),
     re.compile(r'(\d{1,2}/\d{1,2}/\d{4})'),
     re.compile(r'(\d{4}-\d{2}-\d{2})'),
 ]
+# 续期按钮(中/英界面)
+RENEW_OPEN_TEXTS = ["续期免费套餐", "Renew free plan", "Renew free"]
+RENEW_CONFIRM_TEXTS = ["续期 4 天", "Renew 4 days", "续期4天", "Renew 4 d"]
+# 冷却期文案(中/英):
+#   中文面板: "23:53:05 后可续期"
+#   英文面板: "Renewal cooldown 23:07:37" / "Cooldown 5h 30m"
+COOLDOWN_HINT_RE = re.compile(
+    r'(\d{1,2}[:：]\d{2}[:：]\d{2})'
+    r'|(\d+(?:\.\d+)?\s*(?:小时|分钟|秒|hours?|hrs?|minutes?|mins?|seconds?|secs?|h|m|s)\b)',
+    re.IGNORECASE)
+# 未到续期/冷却等提示(中英)
+NOT_NOW_RE = re.compile(
+    r"(已续期|无法续期|还不能续期|稍后再试|已达到|冷却|后可续期|"
+    r"cooldown|too early|already renewed|can'?t renew|cannot renew|not yet|"
+    r"available in|try again)", re.IGNORECASE)
 
 MONTHS = {m: i + 1 for i, m in enumerate(
     ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'])}
@@ -85,55 +96,36 @@ def _norm_date(s):
     s = (s or "").strip().rstrip('.')
     if not s:
         return None
-    # Oct 28, 2026 / October 28 2026
-    m = re.match(r'([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})', s)
+    m = re.match(r'([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})', s)   # Oct 28, 2026
     if m:
         mon = MONTHS.get(m.group(1)[:3].lower())
         if mon:
             return f"{m.group(3)}-{mon:02d}-{int(m.group(2)):02d}"
-    # YYYY/MM/DD 或 YYYY-MM-DD
-    m = re.match(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', s)
+    m = re.match(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', s)            # YYYY/MM/DD
     if m:
         return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    # MM/DD/YYYY (英文界面, 美式) —— 无法确定日月顺序时, 若首段 >12 则是日/月
-    m = re.match(r'(\d{1,2})/(\d{1,2})/(\d{4})', s)
+    m = re.match(r'(\d{1,2})/(\d{1,2})/(\d{4})', s)                  # MM/DD/YYYY 或 DD/MM/YYYY
     if m:
         a, b, y = int(m.group(1)), int(m.group(2)), m.group(3)
-        if a > 12:          # DD/MM/YYYY
+        if a > 12:      # 首段>12 只能是日
             return f"{y}-{b:02d}-{a:02d}"
-        return f"{y}-{a:02d}-{b:02d}"   # MM/DD/YYYY
+        return f"{y}-{a:02d}-{b:02d}"
     return None
+
+def log(message):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 def _parse_due(text):
     for rx in DUE_DATE_RES:
         m = rx.search(text)
         if m:
-            if m.lastindex and m.lastindex >= 3 and rx.pattern.startswith(r'(\d{4})\s*年'):
+            if m.lastindex and m.lastindex >= 3 and '年' in rx.pattern:
                 return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
             norm = _norm_date(m.group(1))
             if norm:
                 return norm
             return m.group(1).strip()
     return None
-# 续期按钮(中/英界面)
-RENEW_OPEN_TEXTS = ["续期免费套餐", "Renew free plan", "Renew free"]
-RENEW_CONFIRM_TEXTS = ["续期 4 天", "Renew 4 days", "续期4天", "Renew 4 d"]
-# 冷却期文案(中/英):
-#   中文面板: "23:53:05 后可续期" / "1 小时 后可续期"
-#   英文面板: "Renewal cooldown 23:07:37" / "Cooldown 5h 30m"
-COOLDOWN_HINT_RE = re.compile(
-    r'(?:cooldown[:\s]*)?(\d{1,2}[:：]\d{2}[:：]\d{2})\s*(?:后可续期|后可以续期)?'
-    r'|(?:cooldown[:\s]*)?(\d+(?:\.\d+)?\s*(?:小时|分钟|秒|hours?|hrs?|minutes?|mins?|seconds?|secs?|h|m|s)\b)',
-    re.IGNORECASE)
-# 未到续期/冷却等提示(中英)
-NOT_NOW_RE = re.compile(
-    r"(已续期|无法续期|还不能续期|稍后再试|已达到|冷却|后可续期|"
-    r"cooldown|too early|already renewed|can'?t renew|cannot renew|not yet|"
-    r"available in|try again)",
-    re.IGNORECASE)
-
-def log(message):
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 # ==================== IP / 通知 ====================
 def get_current_ip():
@@ -146,23 +138,20 @@ def get_current_ip():
     return "获取失败"
 
 def _fmt_date_cn(s):
-    """YYYY-MM-DD -> 2026年10月29日 周四"""
+    """YYYY-MM-DD -> 2026年10月29日 (周四)"""
     if not s or s == "未知":
         return "未知"
     try:
         dt = time.strptime(s, "%Y-%m-%d")
-        weekday = "一二三四五六日"[dt.tm_wday]
-        return f"{dt.tm_year}年{dt.tm_mon:02d}月{dt.tm_mday:02d}日 (周{weekday})"
+        return f"{dt.tm_year}年{dt.tm_mon:02d}月{dt.tm_mday:02d}日 (周{'一二三四五六日'[dt.tm_wday]})"
     except Exception:
         return s
 
 def _days_left(s):
-    """距到期还有几天"""
     if not s or s == "未知":
         return None
     try:
-        dt = time.mktime(time.strptime(s, "%Y-%m-%d"))
-        return int(round((dt - time.time()) / 86400))
+        return int(round((time.mktime(time.strptime(s, "%Y-%m-%d")) - time.time()) / 86400))
     except Exception:
         return None
 
@@ -210,7 +199,7 @@ def build_notification_text(status, old_due, new_due, current_ip="未知"):
     return "\n".join(lines)
 
 def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
-    """发送排版精美的 Telegram 通知 (HTML 格式)"""
+    """发送排版精美的 Telegram 通知 (HTML)"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("Telegram 未配置，跳过通知")
         return
@@ -224,16 +213,13 @@ def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
         if r.status_code == 200:
             log("Telegram 通知发送成功")
         else:
-            # HTML 解析失败时退回纯文本
-            log(f"Telegram HTML 通知失败({r.status_code}), 回退纯文本: {r.text[:120]}")
+            log(f"Telegram HTML 通知失败({r.status_code})，回退纯文本: {r.text[:120]}")
             plain = re.sub(r'<[^>]+>', '', text)
             r2 = requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
                                json={"chat_id": TG_CHAT_ID, "text": plain},
                                timeout=10, proxies=REQUESTS_PROXIES)
-            if r2.status_code == 200:
-                log("Telegram 通知发送成功(纯文本)")
-            else:
-                log(f"Telegram 通知失败: {r2.text[:200]}")
+            log("Telegram 通知发送成功(纯文本)" if r2.status_code == 200
+                else f"Telegram 通知失败: {r2.text[:200]}")
     except Exception as e:
         log(f"Telegram 通知异常: {e}")
 
@@ -357,15 +343,43 @@ def handle_cloudflare(page, timeout=None):
     log("CF 验证超时")
     return False
 
+def _captcha_pending(page):
+    """页面存在 Turnstile 占位节点但没有 token -> 验证尚未完成(可能是组件未渲染)"""
+    try:
+        return page.evaluate("""() => {
+            const hasWidget = !!document.querySelector(
+                '[id*="cf-chl-widget"], .cf-turnstile, #cf-turnstile, input[name="cf-turnstile-response"]');
+            const inp = document.querySelector('input[name="cf-turnstile-response"]');
+            const hasToken = !!(inp && inp.value && inp.value.length > 30);
+            return hasWidget && !hasToken;
+        }""")
+    except Exception:
+        return False
+
 def solve_turnstile(page, timeout=90):
-    """处理页面内嵌 Turnstile(登录表单 / 续期弹窗共用)"""
+    """处理页面内嵌 Turnstile(登录表单 / 续期弹窗共用)。
+
+    点击节奏保持 5 秒一次(实测可一次通过)。若验证框迟迟不出现,
+    先确认是"无需验证"还是"组件被网络拦截未渲染", 后者直接返回 False,
+    避免表单在无 token 状态下提交(会触发 Please complete the captcha 并使组件重置)。
+    """
     if _get_turnstile_token(page):
         return True
     frames = _find_visible_cf_frames(page)
     if not frames:
-        time.sleep(2)
-        if _get_turnstile_token(page) or not _find_visible_cf_frames(page):
-            return True
+        # 组件可能仍在加载: 最多再等 ~15 秒
+        for _ in range(10):
+            time.sleep(1.5)
+            if _get_turnstile_token(page):
+                return True
+            frames = _find_visible_cf_frames(page)
+            if frames:
+                break
+        if not frames:
+            if _captcha_pending(page):
+                log("⚠️ Turnstile 占位存在但未渲染（Cloudflare 资源可能被网络拦截），不提交表单")
+                return False
+            return True   # 页面确实无 Turnstile
     log("处理 Turnstile 人机验证...")
     start = time.time()
     last_click = 0
@@ -412,28 +426,20 @@ def _detect_channel():
 def open_browser(p):
     proxy_arg = {"server": PROXY_SERVER} if IS_PROXY else None
     channel = _detect_channel()
-    # 固定中文 locale: 站点按浏览器语言渲染界面, GitHub Actions runner 默认英文
-    # 会导致界面/日期格式不同。固定 zh-CN 让行为在本地与 Actions 完全一致。
-    ctx_kwargs = {
-        'viewport': {'width': 1440, 'height': 900},
-        'locale': BROWSER_LOCALE,
-        'timezone_id': 'Asia/Shanghai',
-    }
     if USING_PATCHRIGHT and channel:
         try:
             browser = p.chromium.launch(channel=channel, headless=False,
-                                        args=['--disable-infobars',
-                                              f'--lang={BROWSER_LOCALE}'], proxy=proxy_arg)
-            ctx = browser.new_context(proxy=proxy_arg, **ctx_kwargs)
-            log(f"启动反检测浏览器 (patchright + {channel}, locale={BROWSER_LOCALE})")
+                                        args=['--disable-infobars'], proxy=proxy_arg)
+            ctx = browser.new_context(viewport={'width': 1440, 'height': 900}, proxy=proxy_arg)
+            log(f"启动反检测浏览器 (patchright + {channel})")
             return browser, ctx.new_page()
         except Exception as e:
             log(f"patchright 启动失败: {e}")
     log("使用内置 chromium (过 CF 能力较弱)")
     browser = p.chromium.launch(headless=False,
-        args=['--no-sandbox', '--disable-blink-features=AutomationControlled',
-              '--disable-infobars', f'--lang={BROWSER_LOCALE}'])
-    ctx = browser.new_context(user_agent=DEFAULT_UA, proxy=proxy_arg, **ctx_kwargs)
+        args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars'])
+    ctx = browser.new_context(viewport={'width': 1440, 'height': 900},
+                              user_agent=DEFAULT_UA, proxy=proxy_arg)
     page = ctx.new_page()
     page.add_init_script("try { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); } catch(e) {}")
     return browser, page
@@ -576,7 +582,7 @@ def _detect_cooldown(page):
 
     try:
         info = page.evaluate("""() => {
-            const out = {texts: [], body: ''};
+            const out = {texts: []};
             document.querySelectorAll('button').forEach(b => {
                 const t = (b.innerText||'').trim();
                 if (t && b.disabled) out.texts.push(t);
