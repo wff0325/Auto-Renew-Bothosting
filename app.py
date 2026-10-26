@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 import os, re, sys, time, random, shutil
 
 # ==================== 本地 .env 加载(不提交仓库) ====================
@@ -30,6 +31,7 @@ TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""
 IS_PROXY     = os.environ.get('IS_PROXY', 'false').lower() == 'true'
 PROXY_SERVER = (os.environ.get('PROXY_SERVER') or "http://127.0.0.1:1081").strip()
 BROWSER_CHANNEL = os.environ.get('BROWSER_CHANNEL') or ""
+BROWSER_LOCALE = os.environ.get('BROWSER_LOCALE') or "zh-CN"   # 固定界面语言, 避免 Actions(英文) 与本地(中文) 差异
 SECURITY_TIMEOUT = int(os.environ.get('SECURITY_TIMEOUT') or "240")
 
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
@@ -54,34 +56,84 @@ SECURITY_TITLE_HINTS = ('security verification', 'just a moment', 'attention req
 DEFAULT_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
               '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
 
-# 到期日: "2026/10/28 到期" / "2026-10-28" / "2026年10月28日"
+# 到期日(兼容中英文界面多种写法):
+#   中文面板: "2026/10/28 到期" / "2026年10月28日"
+#   英文面板: "Expires 10/28/2026" / "Expires on Oct 28, 2026" / "2026-10-28"
+#   注意: 美式是 月/日/年, 中式是 年/月/日, 需分别解析
 DUE_DATE_RES = [
+    # 带明确前缀的英文/中文标签
+    re.compile(r'(?:expires?(?:\s+on)?|renew(?:al)?\s+date|due(?:\s+on)?|到期(?:时间|日)?)\s*:?\s*'
+               r'([A-Z][a-z]{2,8}\.?\s+\d{1,2},?\s+\d{4})', re.IGNORECASE),
+    re.compile(r'(?:expires?(?:\s+on)?|renew(?:al)?\s+date|due(?:\s+on)?)\s*:?\s*'
+               r'(\d{1,2}/\d{1,2}/\d{4})', re.IGNORECASE),
+    re.compile(r'(?:expires?(?:\s+on)?|renew(?:al)?\s+date|due(?:\s+on)?)\s*:?\s*'
+               r'(\d{4}-\d{1,2}-\d{1,2})', re.IGNORECASE),
+    # 中文面板: 年/月/日 或 年月日
     re.compile(r'(\d{4}/\d{1,2}/\d{1,2})\s*到期'),
-    re.compile(r'(\d{4}[/-]\d{1,2}[/-]\d{1,2})'),
     re.compile(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日'),
+    # 无前缀兜底
+    re.compile(r'(\d{4}/\d{1,2}/\d{1,2})'),
+    re.compile(r'(\d{1,2}/\d{1,2}/\d{4})'),
+    re.compile(r'(\d{4}-\d{2}-\d{2})'),
 ]
+
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'])}
+
+def _norm_date(s):
+    """把各种日期写法统一成 YYYY-MM-DD, 便于比较"""
+    s = (s or "").strip().rstrip('.')
+    if not s:
+        return None
+    # Oct 28, 2026 / October 28 2026
+    m = re.match(r'([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})', s)
+    if m:
+        mon = MONTHS.get(m.group(1)[:3].lower())
+        if mon:
+            return f"{m.group(3)}-{mon:02d}-{int(m.group(2)):02d}"
+    # YYYY/MM/DD 或 YYYY-MM-DD
+    m = re.match(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', s)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    # MM/DD/YYYY (英文界面, 美式) —— 无法确定日月顺序时, 若首段 >12 则是日/月
+    m = re.match(r'(\d{1,2})/(\d{1,2})/(\d{4})', s)
+    if m:
+        a, b, y = int(m.group(1)), int(m.group(2)), m.group(3)
+        if a > 12:          # DD/MM/YYYY
+            return f"{y}-{b:02d}-{a:02d}"
+        return f"{y}-{a:02d}-{b:02d}"   # MM/DD/YYYY
+    return None
+
+def _parse_due(text):
+    for rx in DUE_DATE_RES:
+        m = rx.search(text)
+        if m:
+            if m.lastindex and m.lastindex >= 3 and rx.pattern.startswith(r'(\d{4})\s*年'):
+                return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+            norm = _norm_date(m.group(1))
+            if norm:
+                return norm
+            return m.group(1).strip()
+    return None
 # 续期按钮(中/英界面)
 RENEW_OPEN_TEXTS = ["续期免费套餐", "Renew free plan", "Renew free"]
-RENEW_CONFIRM_TEXTS = ["续期 4 天", "Renew 4 days", "续期4天"]
-# 冷却期按钮文案: "23:53:05 后可续期" / "Renew available in 5h" / "X 后可续期"
-COOLDOWN_RE = re.compile(r'(\d{1,2}[:：]\d{2}[:：]\d{2}|\d+\s*(?:小时|分钟|秒|h|m|s))\s*(?:后)?'
-                         r'(?:可续期|可再次续期|后可以续期|until renew|before renew)', re.IGNORECASE)
-COOLDOWN_HINT_RE = re.compile(r'(\d{1,2}[:：]\d{2}[:：]\d{2})\s*后可续期')
-# 未到续期/已达上限等提示
-NOT_NOW_RE = re.compile(r"(已续期|无法续期|还不能续期|稍后再试|已达到|冷却|too early|already renewed|"
-                        r"can'?t renew|cannot renew|not yet|后可续期)", re.IGNORECASE)
+RENEW_CONFIRM_TEXTS = ["续期 4 天", "Renew 4 days", "续期4天", "Renew 4 d"]
+# 冷却期文案(中/英):
+#   中文面板: "23:53:05 后可续期" / "1 小时 后可续期"
+#   英文面板: "Renewal cooldown 23:07:37" / "Cooldown 5h 30m"
+COOLDOWN_HINT_RE = re.compile(
+    r'(?:cooldown[:\s]*)?(\d{1,2}[:：]\d{2}[:：]\d{2})\s*(?:后可续期|后可以续期)?'
+    r'|(?:cooldown[:\s]*)?(\d+(?:\.\d+)?\s*(?:小时|分钟|秒|hours?|hrs?|minutes?|mins?|seconds?|secs?|h|m|s)\b)',
+    re.IGNORECASE)
+# 未到续期/冷却等提示(中英)
+NOT_NOW_RE = re.compile(
+    r"(已续期|无法续期|还不能续期|稍后再试|已达到|冷却|后可续期|"
+    r"cooldown|too early|already renewed|can'?t renew|cannot renew|not yet|"
+    r"available in|try again)",
+    re.IGNORECASE)
 
 def log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
-
-def _parse_due(text):
-    for i, rx in enumerate(DUE_DATE_RES):
-        m = rx.search(text)
-        if m:
-            if i == 2:
-                return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-            return m.group(1)
-    return None
 
 # ==================== IP / 通知 ====================
 def get_current_ip():
@@ -93,33 +145,95 @@ def get_current_ip():
         log(f"获取出口IP失败: {e}")
     return "获取失败"
 
-def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log("Telegram 未配置，跳过通知")
-        return
+def _fmt_date_cn(s):
+    """YYYY-MM-DD -> 2026年10月29日 周四"""
+    if not s or s == "未知":
+        return "未知"
+    try:
+        dt = time.strptime(s, "%Y-%m-%d")
+        weekday = "一二三四五六日"[dt.tm_wday]
+        return f"{dt.tm_year}年{dt.tm_mon:02d}月{dt.tm_mday:02d}日 (周{weekday})"
+    except Exception:
+        return s
+
+def _days_left(s):
+    """距到期还有几天"""
+    if not s or s == "未知":
+        return None
+    try:
+        dt = time.mktime(time.strptime(s, "%Y-%m-%d"))
+        return int(round((dt - time.time()) / 86400))
+    except Exception:
+        return None
+
+def build_notification_text(status, old_due, new_due, current_ip="未知"):
+    """构造 Telegram 通知文本(HTML)。独立成函数便于预览/测试。"""
     now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + 8 * 3600))
     if '@' in EMAIL:
         name, domain = EMAIL.split('@', 1)
         masked = f"{name[:2]}****{name[-2:]}@{domain}" if len(name) > 4 else f"{name}@{domain}"
     else:
-        masked = EMAIL[:2] + '****'
-    text = (
-        f"Bot-Hosting 续期通知\n\n"
-        f"{status}\n"
-        f"账号: {masked}\n"
-        f"续期前到期: {old_due}\n"
-        f"续期后到期: {new_due}\n"
-        f"使用IP: {current_ip}\n"
-        f"时间: {now}"
-    )
+        masked = (EMAIL[:2] + '****') if EMAIL else "未配置"
+
+    if status.startswith("续期成功"):
+        icon, title = "✅", "续期成功"
+    elif "冷却" in status:
+        icon, title = "⏳", "续期冷却中"
+    elif "未到" in status:
+        icon, title = "🕐", "未到续期时间"
+    elif "失败" in status:
+        icon, title = "❌", "续期失败"
+    else:
+        icon, title = "ℹ️", status
+
+    left = _days_left(new_due)
+    left_txt = f"（剩 {left} 天）" if left is not None else ""
+
+    lines = [
+        f"<b>{icon} Bot-Hosting 续期通知</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"<b>状态</b>　　{title}",
+        f"<b>账号</b>　　<code>{masked}</code>",
+        "",
+        "<b>📅 到期时间</b>",
+        f"　续期前　{_fmt_date_cn(old_due)}",
+        f"　续期后　<b>{_fmt_date_cn(new_due)}</b>{left_txt}",
+    ]
+    if "冷却" in status:
+        lines.append(f"　等待　　{status}")
+    lines += [
+        "",
+        "<b>🌐 运行环境</b>",
+        f"　出口 IP　<code>{current_ip}</code>",
+        f"　时间　　{now} (UTC+8)",
+    ]
+    return "\n".join(lines)
+
+def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
+    """发送排版精美的 Telegram 通知 (HTML 格式)"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("Telegram 未配置，跳过通知")
+        return
+    text = build_notification_text(status, old_due, new_due, current_ip)
     try:
         r = requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                          json={"chat_id": TG_CHAT_ID, "text": text},
+                          json={"chat_id": TG_CHAT_ID, "text": text,
+                                "parse_mode": "HTML",
+                                "disable_web_page_preview": True},
                           timeout=10, proxies=REQUESTS_PROXIES)
         if r.status_code == 200:
             log("Telegram 通知发送成功")
         else:
-            log(f"Telegram 通知失败: {r.text}")
+            # HTML 解析失败时退回纯文本
+            log(f"Telegram HTML 通知失败({r.status_code}), 回退纯文本: {r.text[:120]}")
+            plain = re.sub(r'<[^>]+>', '', text)
+            r2 = requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                               json={"chat_id": TG_CHAT_ID, "text": plain},
+                               timeout=10, proxies=REQUESTS_PROXIES)
+            if r2.status_code == 200:
+                log("Telegram 通知发送成功(纯文本)")
+            else:
+                log(f"Telegram 通知失败: {r2.text[:200]}")
     except Exception as e:
         log(f"Telegram 通知异常: {e}")
 
@@ -298,20 +412,28 @@ def _detect_channel():
 def open_browser(p):
     proxy_arg = {"server": PROXY_SERVER} if IS_PROXY else None
     channel = _detect_channel()
+    # 固定中文 locale: 站点按浏览器语言渲染界面, GitHub Actions runner 默认英文
+    # 会导致界面/日期格式不同。固定 zh-CN 让行为在本地与 Actions 完全一致。
+    ctx_kwargs = {
+        'viewport': {'width': 1440, 'height': 900},
+        'locale': BROWSER_LOCALE,
+        'timezone_id': 'Asia/Shanghai',
+    }
     if USING_PATCHRIGHT and channel:
         try:
             browser = p.chromium.launch(channel=channel, headless=False,
-                                        args=['--disable-infobars'], proxy=proxy_arg)
-            ctx = browser.new_context(viewport={'width': 1440, 'height': 900}, proxy=proxy_arg)
-            log(f"启动反检测浏览器 (patchright + {channel})")
+                                        args=['--disable-infobars',
+                                              f'--lang={BROWSER_LOCALE}'], proxy=proxy_arg)
+            ctx = browser.new_context(proxy=proxy_arg, **ctx_kwargs)
+            log(f"启动反检测浏览器 (patchright + {channel}, locale={BROWSER_LOCALE})")
             return browser, ctx.new_page()
         except Exception as e:
             log(f"patchright 启动失败: {e}")
     log("使用内置 chromium (过 CF 能力较弱)")
     browser = p.chromium.launch(headless=False,
-        args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars'])
-    ctx = browser.new_context(viewport={'width': 1440, 'height': 900},
-                              user_agent=DEFAULT_UA, proxy=proxy_arg)
+        args=['--no-sandbox', '--disable-blink-features=AutomationControlled',
+              '--disable-infobars', f'--lang={BROWSER_LOCALE}'])
+    ctx = browser.new_context(user_agent=DEFAULT_UA, proxy=proxy_arg, **ctx_kwargs)
     page = ctx.new_page()
     page.add_init_script("try { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); } catch(e) {}")
     return browser, page
@@ -443,11 +565,18 @@ def _visible_messages(page):
         return []
 
 def _detect_cooldown(page):
-    """检测续期冷却期。免费套餐续期有间隔限制, 冷却中按钮显示 'X 后可续期' 且禁用。
+    """检测续期冷却期。免费套餐续期有间隔限制, 冷却中按钮显示倒计时且禁用。
+    兼容中文("23:53:05 后可续期")与英文("Renewal cooldown 23:07:37")界面。
     返回冷却剩余时间文本, 否则返回空串"""
+    def _pick(text):
+        m = COOLDOWN_HINT_RE.search(text)
+        if not m:
+            return ""
+        return (m.group(1) or m.group(2) or "").strip()
+
     try:
         info = page.evaluate("""() => {
-            const out = {texts: []};
+            const out = {texts: [], body: ''};
             document.querySelectorAll('button').forEach(b => {
                 const t = (b.innerText||'').trim();
                 if (t && b.disabled) out.texts.push(t);
@@ -456,12 +585,10 @@ def _detect_cooldown(page):
             return out;
         }""")
         for t in info.get("texts", []):
-            m = COOLDOWN_HINT_RE.search(t)
-            if m:
-                return m.group(1)
-        m = COOLDOWN_HINT_RE.search(info.get("body", ""))
-        if m:
-            return m.group(1)
+            cd = _pick(t)
+            if cd:
+                return cd
+        return _pick(info.get("body", ""))
     except Exception:
         pass
     return ""
