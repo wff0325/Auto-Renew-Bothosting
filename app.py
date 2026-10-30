@@ -1,6 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+bot-hosting.net 免费套餐自动续期脚本
+参考架构: https://github.com/wff0325/yincangyun (patchright 过 CF + 环境变量配置 + TG 通知)
 
+站点特点(已实测确认):
+  - 登录: 两步式 —— 先填邮箱点 "Continue with email", 再填密码 + Cloudflare Turnstile
+          (也支持 Discord/GitHub OAuth, 脚本只走邮箱)
+  - 续期: /a/billings 页点 "续期免费套餐" 打开弹窗 -> 弹窗内 Turnstile 验证 ->
+          "续期 4 天" 按钮解锁 -> 点击 -> 到期日 +4 天
+  - 免费套餐每 4 天需手动续期一次, 拖动窗口: 当前到期前可续(延长 4 天)
+  - 到期显示: "2026/10/28 到期。手动续期可再延长 4 天。"
+
+用法:
+    本地: .env 写 BOT_HOSTING_EMAIL / BOT_HOSTING_PASSWORD, 然后 python app.py
+    Actions: Secrets 配 BOT_HOSTING_EMAIL / BOT_HOSTING_PASSWORD (+ 可选 NODE_LINK/TG_*)
+
+配置项(环境变量):
+    BOT_HOSTING_EMAIL     登录邮箱 (必填)
+    BOT_HOSTING_PASSWORD  登录密码 (必填)
+    TG_BOT_TOKEN          Telegram Bot Token (可选)
+    TG_CHAT_ID            Telegram Chat ID   (可选)
+    IS_PROXY              是否使用代理 (默认 false; workflow 代理步骤会写入)
+    PROXY_SERVER          代理地址 (默认 http://127.0.0.1:1081)
+    BROWSER_CHANNEL       浏览器通道 (msedge/chrome, 空=自动探测)
+    SECURITY_TIMEOUT      CF 验证等待秒数 (默认 240)
+"""
 
 import os, re, sys, time, random, shutil
 
@@ -73,14 +98,14 @@ DUE_DATE_RES = [
     re.compile(r'(\d{4}-\d{2}-\d{2})'),
 ]
 # 续期按钮(中/英界面)
-RENEW_OPEN_TEXTS = ["续期免费套餐", "Renew free plan", "Renew free"]
-RENEW_CONFIRM_TEXTS = ["续期 4 天", "Renew 4 days", "续期4天", "Renew 4 d"]
-# 冷却期文案(中/英):
-#   中文面板: "23:53:05 后可续期"
-#   英文面板: "Renewal cooldown 23:07:37" / "Cooldown 5h 30m"
+RENEW_OPEN_TEXTS = ["续期免费套餐", "Renew free plan", "Renew free", "续期套餐", "续期"]
+RENEW_CONFIRM_TEXTS = ["续期 4 天", "Renew 4 days", "续期4天", "Renew 4 d", "续期 4天"]
+# 冷却期文案(中/英)。注意: 必须带冷却关键词, 不能只凭时间格式 ——
+# 页面别处的时间戳(如 20:01:44)会被误判成冷却期。
+COOLDOWN_KEYWORDS = ('cooldown', '冷却', '后可续期', '后可以续期', '待可续期')
 COOLDOWN_HINT_RE = re.compile(
     r'(\d{1,2}[:：]\d{2}[:：]\d{2})'
-    r'|(\d+(?:\.\d+)?\s*(?:小时|分钟|秒|hours?|hrs?|minutes?|mins?|seconds?|secs?|h|m|s)\b)',
+    r'|(\d+(?:\.\d+)?\s*(?:小时|分钟|秒|hours?|hrs?|minutes?|mins?|seconds?|secs?)\b)',
     re.IGNORECASE)
 # 未到续期/冷却等提示(中英)
 NOT_NOW_RE = re.compile(
@@ -571,9 +596,14 @@ def _visible_messages(page):
         return []
 
 def _detect_cooldown(page):
-    """检测续期冷却期。免费套餐续期有间隔限制, 冷却中按钮显示倒计时且禁用。
-    兼容中文("23:53:05 后可续期")与英文("Renewal cooldown 23:07:37")界面。
-    返回冷却剩余时间文本, 否则返回空串"""
+    """检测续期冷却期。
+
+    严格条件(缺一不可, 否则会误判成冷却而跳过续期):
+      1) 按钮处于 disabled 状态
+      2) 按钮文案含冷却关键词(cooldown / 冷却 / 后可续期)
+      3) 文案里能解析出倒计时
+    不再扫描整个页面文本 —— 页面上的时间戳(20:01:44)会被误当成冷却倒计时。
+    """
     def _pick(text):
         m = COOLDOWN_HINT_RE.search(text)
         if not m:
@@ -581,20 +611,21 @@ def _detect_cooldown(page):
         return (m.group(1) or m.group(2) or "").strip()
 
     try:
-        info = page.evaluate("""() => {
-            const out = {texts: []};
+        texts = page.evaluate("""() => {
+            const out = [];
             document.querySelectorAll('button').forEach(b => {
                 const t = (b.innerText||'').trim();
-                if (t && b.disabled) out.texts.push(t);
+                if (t && b.disabled) out.push(t);
             });
-            out.body = document.body ? document.body.innerText.slice(0, 4000) : '';
             return out;
         }""")
-        for t in info.get("texts", []):
+        for t in texts:
+            low = t.lower()
+            if not any(k in low for k in COOLDOWN_KEYWORDS):
+                continue
             cd = _pick(t)
             if cd:
                 return cd
-        return _pick(info.get("body", ""))
     except Exception:
         pass
     return ""
