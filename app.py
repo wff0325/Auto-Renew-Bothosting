@@ -7,10 +7,13 @@ bot-hosting.net 免费套餐自动续期脚本
 站点特点(已实测确认):
   - 登录: 两步式 —— 先填邮箱点 "Continue with email", 再填密码 + Cloudflare Turnstile
           (也支持 Discord/GitHub OAuth, 脚本只走邮箱)
-  - 续期: /a/billings 页点 "续期免费套餐" 打开弹窗 -> 弹窗内 Turnstile 验证 ->
-          "续期 4 天" 按钮解锁 -> 点击 -> 到期日 +4 天
-  - 免费套餐每 4 天需手动续期一次, 拖动窗口: 当前到期前可续(延长 4 天)
-  - 到期显示: "2026/10/28 到期。手动续期可再延长 4 天。"
+  - 续期: /a/billings 页点 "续期免费套餐" 打开弹窗(#renew-dialog) -> 弹窗内 Turnstile 验证 ->
+          "续期 4 天" 按钮解锁 -> 点击 -> 前端 POST /api/billing/renew-free(带 turnstileToken)
+          -> 到期日 +4 天, 弹出 toast "已续期 4 天。"
+  - 免费套餐每 4 天需手动续期一次; 到期前 3 天(72h)解锁续期按钮, 续期后约 24h 冷却
+  - 到期显示: "2026/11/03 到期。手动续期可再延长 4 天。"
+  - ⚠️ 到期前 48h 内, 账单页顶部会多出一条提醒横幅, 里面那个按钮文案同样是 "续期 4 天",
+     它只负责打开弹窗。确认按钮必须限定在弹窗内查找, 否则会点错。
 
 用法:
     本地: .env 写 BOT_HOSTING_EMAIL / BOT_HOSTING_PASSWORD, 然后 python app.py
@@ -98,8 +101,13 @@ DUE_DATE_RES = [
     re.compile(r'(\d{4}-\d{2}-\d{2})'),
 ]
 # 续期按钮(中/英界面)
+# 注意(2026-11 改版): 到期前 48 小时内, 账单页顶部会多出一条提醒横幅,
+# 横幅里那个按钮的文案也是「续期 4 天」—— 它只负责打开弹窗, 不是确认按钮。
+# 所以: 打开弹窗用 RENEW_OPEN_TEXTS, 确认必须限定在弹窗内找(_dialog_confirm)。
 RENEW_OPEN_TEXTS = ["续期免费套餐", "Renew free plan", "Renew free", "续期套餐", "续期"]
-RENEW_CONFIRM_TEXTS = ["续期 4 天", "Renew 4 days", "续期4天", "Renew 4 d", "续期 4天"]
+RENEW_CONFIRM_TEXTS = ["续期 4 天", "Renew for 4 days", "Renew 4 days", "续期4天", "Renew 4 d", "续期 4天"]
+# 续期成功的 toast 文案(中/英)。新版点击确认后走 /api/billing/renew-free, 成功弹 toast
+SUCCESS_HINTS = ("已续期", "续期成功", "已恢复并续期", "Renewed for 4 days", "Plan rescued")
 # 冷却期文案(中/英)。注意: 必须带冷却关键词, 不能只凭时间格式 ——
 # 页面别处的时间戳(如 20:01:44)会被误判成冷却期。
 COOLDOWN_KEYWORDS = ('cooldown', '冷却', '后可续期', '后可以续期', '待可续期')
@@ -584,7 +592,7 @@ def _visible_messages(page):
     try:
         return page.evaluate("""() => {
             const out = [];
-            document.querySelectorAll('[role="dialog"], [role="alert"], .alert, .toast, [data-sonner-toast]')
+            document.querySelectorAll('[role="dialog"], [role="alert"], .alert, .toast, .bd-note, [data-sonner-toast]')
                 .forEach(m => {
                     const r = m.getBoundingClientRect();
                     const t = (m.innerText||'').trim();
@@ -594,6 +602,66 @@ def _visible_messages(page):
         }""")
     except Exception:
         return []
+
+def _success_msg(page):
+    """页面/toast 里是否出现了续期成功提示"""
+    for m in _visible_messages(page):
+        for k in SUCCESS_HINTS:
+            if k.lower() in m.lower():
+                return m
+    return ""
+
+def _find_renew_dialog(page, timeout=20):
+    """等续期弹窗出现。
+
+    改版后弹窗有固定 id `#renew-dialog`; 老版本没有 id, 用 role=dialog 兜底。
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            d = page.locator('#renew-dialog')
+            if d.count() > 0 and d.first.is_visible():
+                return d.first
+        except Exception:
+            pass
+        try:
+            ds = page.locator('[role="dialog"]')
+            for i in range(ds.count()):
+                d = ds.nth(i)
+                try:
+                    if not d.is_visible():
+                        continue
+                    txt = d.inner_text() or ''
+                except Exception:
+                    continue
+                if '续期' in txt and ('4 天' in txt or '4 days' in txt.lower()):
+                    return d
+        except Exception:
+            pass
+        time.sleep(1)
+    return None
+
+def _dialog_confirm(dlg):
+    """只在弹窗内部找「续期 4 天」确认按钮。
+
+    站点改版后, 页面顶部提醒横幅里也有一个同名按钮(它只是打开弹窗),
+    所以绝不能用全页 `page.locator('button:has-text("续期 4 天")').first` ——
+    那样会点到横幅上, 点了等于没点, 到期日不变, 脚本就误判成续期失败。
+    """
+    for t in RENEW_CONFIRM_TEXTS:
+        try:
+            loc = dlg.locator(f'button:has-text("{t}")')
+            if loc.count() > 0:
+                return loc.first, t
+        except Exception:
+            continue
+    try:
+        loc = dlg.locator('button.btn-primary')
+        if loc.count() == 1:
+            return loc.first, "btn-primary"
+    except Exception:
+        pass
+    return None, None
 
 def _detect_cooldown(page):
     """检测续期冷却期。
@@ -700,7 +768,15 @@ def renew_plan(page):
             page.screenshot(path="renew_no_button.png")
             return "NOT_TIME", old_due, old_due, ""
         log(f"已点击: {opened}")
-        time.sleep(4)
+
+        # 等弹窗真的出现(改版后弹窗有固定 id: #renew-dialog)
+        dlg = _find_renew_dialog(page, timeout=20)
+        if dlg is None:
+            log("未等到续期弹窗(界面可能又变了)")
+            _dump_buttons(page)
+            page.screenshot(path="renew_no_dialog.png")
+            return False, old_due, old_due, ""
+        log("续期弹窗已打开")
 
         # 弹窗内人机验证
         log("弹窗内 Turnstile 验证...")
@@ -708,17 +784,18 @@ def renew_plan(page):
             log("Turnstile 未通过，尝试继续(按钮可能已解锁)")
         time.sleep(2)
 
-        # 确认按钮解锁后再点
+        # 确认按钮解锁后再点 —— 只在弹窗内部找, 避免点到页面顶部同名横幅按钮
         confirm = None
         for i in range(6):
-            for t in RENEW_CONFIRM_TEXTS:
-                loc = page.locator(f'button:has-text("{t}")')
-                if loc.count() > 0 and not loc.first.is_disabled():
-                    confirm = loc.first
-                    log(f"确认按钮已解锁: {t}")
-                    break
-            if confirm:
-                break
+            btn, label = _dialog_confirm(dlg)
+            if btn is not None:
+                try:
+                    if not btn.is_disabled():
+                        confirm = btn
+                        log(f"确认按钮已解锁: {label}")
+                        break
+                except Exception:
+                    pass
             log("确认按钮仍禁用，重新过验证...")
             solve_turnstile(page, timeout=45)
             time.sleep(3)
@@ -734,7 +811,8 @@ def renew_plan(page):
         confirm.click(timeout=10000)
         time.sleep(6)
 
-        # 结果: 到期日变化为准
+        # 结果: 到期日变化 / 成功 toast 为准(先取 toast, 因为刷新后它就没了)
+        ok_msg = _success_msg(page)
         new_due = get_due_date(page)
         if new_due == old_due:
             new_due = _read_due_with_retry(page, old_due)
@@ -742,17 +820,24 @@ def renew_plan(page):
         msgs = _visible_messages(page)
         if msgs:
             log(f"页面提示: {msgs}")
-        if any(NOT_NOW_RE.search(m) for m in msgs) and new_due == old_due:
+        if ok_msg:
+            log(f"成功提示: {ok_msg}")
+
+        if new_due != old_due and new_due != "未知":
+            log(f"续期成功! 到期 {old_due} -> {new_due}")
+            return True, old_due, new_due, ""
+        if ok_msg:
+            # toast 已确认续期成功, 只是到期日没刷新出来(缓存/延迟), 同样算成功
+            log(f"续期成功(toast 确认), 到期日未刷新: {old_due}")
+            return True, old_due, new_due, ""
+
+        if any(NOT_NOW_RE.search(m) for m in msgs):
             cd = _detect_cooldown(page)
             if cd:
                 log(f"处于续期冷却期: {cd}")
                 return "COOLDOWN", old_due, old_due, cd
             log("未到续期时间")
             return "NOT_TIME", old_due, old_due, ""
-
-        if new_due != old_due and new_due != "未知":
-            log(f"续期成功! 到期 {old_due} -> {new_due}")
-            return True, old_due, new_due, ""
 
         log(f"到期时间未变化: {old_due}")
         page.screenshot(path="renew_no_change.png")
