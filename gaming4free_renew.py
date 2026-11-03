@@ -92,6 +92,11 @@ PROXY_SERVER = (os.environ.get('PROXY_SERVER') or "http://127.0.0.1:1081").strip
 BROWSER_PATH = os.environ.get('G4F_BROWSER_PATH') or ""
 DEBUG_PORT = int(os.environ.get('G4F_DEBUG_PORT') or "9222")
 VOTER_NAME = os.environ.get('G4F_VOTER_NAME') or "renew-bot"
+# Turnstile 出 token 的耗时波动很大(实测 18s ~ 110s)，超时给足，别卡在 90s
+TS_TIMEOUT = int(os.environ.get('G4F_TS_TIMEOUT') or "180")
+# 复用同一个 profile 目录: 全新 profile 会让 Turnstile 变慢很多
+PROFILE_DIR = os.environ.get('G4F_PROFILE_DIR') or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".g4f_profile")
 
 try:
     from patchright.sync_api import sync_playwright
@@ -154,18 +159,33 @@ def _detect_browser_path():
 
 
 def launch_browser_cdp():
-    """启动真实浏览器进程并返回 (proc, cdp_url)。CDP 接管是关键: 规避自动化指纹。"""
+    """启动真实浏览器进程并返回 (proc, cdp_url)。CDP 接管是关键: 规避自动化指纹。
+
+    踩过的坑:
+      - 每次开全新临时 profile 时 Turnstile 会更慢(18s -> 100s+), 所以默认复用
+        项目目录下 .g4f_profile 目录, 让 clearance cookie 留下来。
+      - 必须关掉 Edge 的 Tracking Prevention, 否则 challenges.cloudflare.com
+        拿不到 storage, 挑战帧反复重载、永不发 token。
+      - --remote-debugging-port 必须是非 0 端口, 否则 navigator.webdriver 变 True。
+    """
     exe = _detect_browser_path()
     if not exe:
         raise RuntimeError("找不到可用的浏览器可执行文件")
-    profile = tempfile.mkdtemp(prefix="g4f_profile_")
+    profile = PROFILE_DIR
+    try:
+        os.makedirs(profile, exist_ok=True)
+    except Exception:
+        profile = tempfile.mkdtemp(prefix="g4f_profile_")
     args = [
         exe,
         f"--remote-debugging-port={DEBUG_PORT}",
         f"--user-data-dir={profile}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-features=msEdgeSidebarV2,msEdgeShoppingAssistant,Translate",
+        # 关掉 Edge 的跟踪保护: 否则 challenges.cloudflare.com 被拦 storage, 永远拿不到 token
+        "--disable-features=TrackingPrevention,msEdgeTrackingPrevention,msEdgeThirdPartyStoragePartitioning",
+        "--disable-sync",
+        "--disable-background-networking",
         "--window-size=1440,900",
         "about:blank",
     ]
@@ -224,16 +244,39 @@ def list_servers(page):
 
 # ==================== Turnstile ====================
 def wait_turnstile_token(page, timeout=90):
-    """等 Turnstile 下发 token; 出现交互式勾选框就点一下。"""
+    """等 Turnstile 下发 token; 出现交互式勾选框就点一下。
+
+    token 落在隐藏域 input[name=cf-turnstile-response]（读不到 window.turnstile，别在这浪费时间）。
+    站点在 iframe 里渲染 Turnstile（challenges.cloudflare.com），Playwright 的 page.frames 能拿到，
+    但 iframe 里的 DOM 要用 frame.evaluate 去找，光靠主文档 querySelector 找不到。
+    """
     t0 = time.time()
+    last_log = 0
     while time.time() - t0 < timeout:
+        # 主文档里找（widget 是主文档渲染的，隐藏域也应在主文档）
         token = page.evaluate(
-            "(document.querySelector('#ts-widget input[name=\"cf-turnstile-response\"]')||{}).value || ''")
+            """() => {
+                const els = document.querySelectorAll('input[name="cf-turnstile-response"]');
+                for (const el of els) { if (el.value) return el.value; }
+                return '';
+            }""")
         if token:
             return token
+        # 有些情况下隐藏域在 iframe 里，也扫一遍
         for fr in page.frames:
             if "challenges.cloudflare.com" not in (fr.url or ""):
                 continue
+            try:
+                token = fr.evaluate(
+                    """() => {
+                        const els = document.querySelectorAll('input[name="cf-turnstile-response"]');
+                        for (const el of els) { if (el.value) return el.value; }
+                        return '';
+                    }""")
+            except Exception:
+                token = ""
+            if token:
+                return token
             for sel in ('input[type="checkbox"]', 'label', '.cb-lb'):
                 try:
                     loc = fr.locator(sel)
@@ -243,12 +286,37 @@ def wait_turnstile_token(page, timeout=90):
                             el.click(timeout=3000)
                 except Exception:
                     pass
+        if time.time() - last_log > 20:
+            last_log = time.time()
+            log(f"  等待 Turnstile token… ({int(time.time() - t0)}s)")
         time.sleep(2)
     return ""
 
 
+def _fetch_vote_response(page, slug, token, voter_name, ad_watched="0"):
+    """自己发 POST /vote, 拿到服务端真实 JSON（不走站点按钮，才能看到 json.error）。"""
+    return page.evaluate(
+        """async ([url, token, name, ad]) => {
+            try {
+                const r = await fetch(url, {method:'POST',
+                    headers:{'Content-Type':'application/json','Accept':'application/json'},
+                    credentials:'omit',
+                    body: JSON.stringify({
+                        'cf-turnstile-response': token,
+                        'voter_name': name || null,
+                        'ad_watched': ad
+                    })});
+                const t = await r.text();
+                let j = null; try { j = JSON.parse(t); } catch(e) {}
+                return {status: r.status, json: j, text: t.slice(0, 500)};
+            } catch(e) { return {error: String(e)}; }
+        }""",
+        [f"{API}/api/servers/{slug}/vote", token, voter_name, ad_watched],
+    )
+
+
 # ==================== 投票 / 捐赠 ====================
-def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None):
+def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"):
     """走站点原生投票流程。返回 dict。"""
     before = server_info(page, slug)
     if before is None:
@@ -261,6 +329,7 @@ def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None):
     if donate_cents:
         return _do_donate(page, slug, donate_cents, h_before)
 
+    # 点投票按钮 -> 弹出 modal -> 渲染 Turnstile
     page.click("#sd-vote-btn")
     page.wait_for_timeout(2500)
 
@@ -271,39 +340,35 @@ def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None):
             break
         page.wait_for_timeout(5000)
 
-    token = wait_turnstile_token(page, timeout=90)
+    token = wait_turnstile_token(page, timeout=TS_TIMEOUT)
     if not token:
         try:
             page.screenshot(path="g4f_captcha_fail.png", timeout=15000, animations="disabled")
         except Exception:
             pass
-        return {"ok": False, "error": "Turnstile 验证未通过", "before": h_before}
+        return {"ok": False, "error": f"Turnstile 验证未通过（{TS_TIMEOUT}s 内没拿到 token）", "before": h_before}
 
-    if voter_name:
-        try:
-            page.fill("#vm-ign", voter_name)
-        except Exception:
-            pass
-    page.click("#vm-submit")
-
-    msg = ""
-    for _ in range(20):
-        page.wait_for_timeout(700)
-        msg = page.evaluate("document.getElementById('vm-msg')?.textContent") or ""
-        if msg and "Submitting" not in msg:
-            break
-    cls = page.evaluate("document.getElementById('vm-msg')?.className") or ""
+    # 拿到 token 后自己发 POST, 这样能拿到服务端真实错误(json.error), 而不是只看到 DOM 提示
+    resp = _fetch_vote_response(page, slug, token, voter_name, ad_watched)
+    data = resp.get("json") or {}
+    ok = bool(resp.get("status") == 200 and data.get("success"))
 
     after = server_info(page, slug) or {}
     h_after = (after.get("server") or {}).get("hours_remaining")
+    reason = ""
+    if not ok:
+        reason = (data.get("error") or data.get("message")
+                  or resp.get("text") or f"HTTP {resp.get('status')}")
     return {
-        "ok": "ok" in cls,
+        "ok": ok,
         "slug": slug,
-        "message": msg,
+        "message": data.get("message") or "",
+        "error": "" if ok else reason,
         "before": h_before,
         "after": h_after,
         "delta": round(h_after - h_before, 2) if (h_before is not None and h_after is not None) else None,
         "cooldown": after.get("cooldown"),
+        "http_status": resp.get("status"),
     }
 
 
@@ -442,6 +507,7 @@ def main():
 
     proc = None
     pw = browser = ctx = page = None
+    exit_code = 0
     try:
         proc, cdp = launch_browser_cdp()
         pw = sync_playwright().start()
@@ -466,7 +532,9 @@ def main():
         for slug in slugs:
             log(f"===== 处理服务器 {slug} =====")
             votes = 0
+            attempts = 0
             status, before, after = "", None, None
+            failed = False
             while True:
                 info = server_info(page, slug)
                 if info is None:
@@ -475,6 +543,7 @@ def main():
                     info = server_info(page, slug)
                     if info is None:
                         status, before, after = "读取服务器信息失败", None, None
+                        failed = True
                         break
                 srv = info.get("server") or {}
                 h = srv.get("hours_remaining")
@@ -510,8 +579,21 @@ def main():
                         log(f"支付链接: {(res.get('donate') or {}).get('redirect_url')}")
                         break
                 else:
-                    status = f"投票续期失败：{res.get('error')}"
-                    log(f"✗ {res.get('error')}")
+                    reason = res.get("error") or "未知原因"
+                    log(f"✗ 投票失败: {reason}  (HTTP {res.get('http_status')})")
+                    # 冷却类错误不用重试（等下一轮 cron 就行）
+                    if "cooldown" in str(reason).lower() or "wait" in str(reason).lower():
+                        status = f"投票续期失败（冷却中）：{reason}"
+                        failed = True
+                        break
+                    # Turnstile 偶发失败很常见，重试（最多 max_votes 次机会用完）
+                    if votes + attempts < max_votes + 2:
+                        attempts += 1
+                        log(f"重试（第 {attempts} 次）…")
+                        time.sleep(10)
+                        continue
+                    status = f"投票续期失败：{reason}"
+                    failed = True
                     break
 
                 if keep_alive:
@@ -521,6 +603,9 @@ def main():
                         time.sleep(min(cd, 6) * 60)
 
             send_telegram_notification(slug, status, before, after, ip)
+            if failed:
+                exit_code = 1
+
     except Exception as e:
         log(f"运行异常: {e}")
         try:
@@ -528,7 +613,7 @@ def main():
                 page.screenshot(path="g4f_error.png", timeout=15000, animations="disabled")
         except Exception:
             pass
-        sys.exit(1)
+        exit_code = 1
     finally:
         try:
             if pw:
@@ -542,7 +627,8 @@ def main():
             pass
 
     log("任务结束")
-    sys.exit(0)
+    # 失败必须返回非 0, 否则 GitHub Actions 会显示绿色但其实没投上票
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

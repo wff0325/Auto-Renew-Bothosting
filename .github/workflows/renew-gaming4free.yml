@@ -18,7 +18,8 @@ permissions:
 jobs:
   renew-gaming4free:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Turnstile 出 token 实测要 18s~200s, 加上失败重试, 20 分钟不够用
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -39,6 +40,16 @@ jobs:
           pip install patchright requests 'requests[socks]'
           python -m patchright install --with-deps chrome
 
+      # Turnstile 对"全新浏览器 profile"会格外严格（实测出 token 要 18s~200s），
+      # 复用同一个 profile 目录能让 clearance cookie 留下来，明显更快更稳。
+      - name: 💾 恢复浏览器 profile 缓存
+        uses: actions/cache@v4
+        with:
+          path: .g4f_profile
+          key: g4f-profile-${{ runner.os }}-${{ hashFiles('.g4f_profile/.keep') }}
+          restore-keys: |
+            g4f-profile-${{ runner.os }}-
+
       - name: ⚙️ 设置sing-box代理
         continue-on-error: true
         env:
@@ -52,11 +63,15 @@ jobs:
           G4F_THRESHOLD: ${{ secrets.G4F_THRESHOLD }}
           G4F_MAX_VOTES: ${{ secrets.G4F_MAX_VOTES }}
           G4F_VOTER_NAME: ${{ secrets.G4F_VOTER_NAME }}
+          G4F_TS_TIMEOUT: ${{ vars.G4F_TS_TIMEOUT || '240' }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           # Turnstile 必须真实浏览器，脚本会自己起一个 Chrome 进程并用 CDP 接管，
           # 所以需要 xvfb 提供显示环境。
+          #
+          # 失败会以非 0 退出码结束 —— 工作流会变红，不要用 `|| true` 掩盖，
+          # 否则会出现"绿勾但其实没投上票"。
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u gaming4free_renew.py
 
       # 更新时间到time.txt,避免6个月未更新导致工作流暂停
