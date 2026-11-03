@@ -31,3 +31,4 @@ _local_test*.txt
 _inline.js
 _*_out.txt
 _corsdiag.py
+_samesite.py
