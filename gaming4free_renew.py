@@ -444,7 +444,7 @@ def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"
     return {
         "ok": ok,
         "slug": slug,
-        "message": data.get("message") or (msg or "").strip(),
+        "message": data.get("message") or "",
         "error": "" if ok else reason,
         "before": h_before,
         "after": h_after,
