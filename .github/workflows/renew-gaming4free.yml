@@ -50,12 +50,16 @@ jobs:
           restore-keys: |
             g4f-profile-${{ runner.os }}-
 
-      - name: ⚙️ 设置sing-box代理
-        continue-on-error: true
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-        run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+      # 注意: 这里**故意不挂代理**。
+      # 实测挂 sing-box 代理时, GitHub runner 上 GET /api/servers 正常但
+      # POST /api/servers/{slug}/vote 直接 "TypeError: Failed to fetch"
+      # (站点自己的 JS 也报 Network error), 整个投票流程走不通。
+      # Turnstile token 与挑战页出口 IP 绑定, 代理链路一旦对 POST 不友好
+      # 就会拿不到可用 token。直连虽然 runner IP 信誉一般, 但链路一致、稳定。
+      #
+      # 如果将来确实需要代理, 用 IS_PROXY 环境变量打开即可:
+      #   IS_PROXY: true
+      #   PROXY_SERVER: socks5://127.0.0.1:1080
 
       - name: 🚀 运行续期脚本
         env:
@@ -64,6 +68,8 @@ jobs:
           G4F_MAX_VOTES: ${{ secrets.G4F_MAX_VOTES }}
           G4F_VOTER_NAME: ${{ secrets.G4F_VOTER_NAME }}
           G4F_TS_TIMEOUT: ${{ vars.G4F_TS_TIMEOUT || '240' }}
+          IS_PROXY: ${{ vars.G4F_USE_PROXY || 'false' }}
+          PROXY_SERVER: socks5://127.0.0.1:1080
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
