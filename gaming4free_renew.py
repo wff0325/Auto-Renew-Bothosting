@@ -294,28 +294,6 @@ def wait_turnstile_token(page, timeout=90):
     return ""
 
 
-def _fetch_vote_response(page, slug, token, voter_name, ad_watched="0"):
-    """自己发 POST /vote, 拿到服务端真实 JSON（不走站点按钮，才能看到 json.error）。"""
-    return page.evaluate(
-        """async ([url, token, name, ad]) => {
-            try {
-                const r = await fetch(url, {method:'POST',
-                    headers:{'Content-Type':'application/json','Accept':'application/json'},
-                    credentials:'omit',
-                    body: JSON.stringify({
-                        'cf-turnstile-response': token,
-                        'voter_name': name || null,
-                        'ad_watched': ad
-                    })});
-                const t = await r.text();
-                let j = null; try { j = JSON.parse(t); } catch(e) {}
-                return {status: r.status, json: j, text: t.slice(0, 500)};
-            } catch(e) { return {error: String(e)}; }
-        }""",
-        [f"{API}/api/servers/{slug}/vote", token, voter_name, ad_watched],
-    )
-
-
 def _diag_fetch(page, url, payload):
     """诊断 fetch 失败原因: 分别试 GET / POST / 预检, 看是 CORS、代理还是网络层问题。"""
     return page.evaluate(
@@ -353,50 +331,6 @@ def _diag_fetch(page, url, payload):
     )
 
 
-# ==================== 投票 / 捐赠 ====================
-def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"):
-    """走站点原生投票流程。返回 dict。
-
-    策略: 用站点自己的按钮流程提交(#vm-submit), 同时在网络层捕获 POST /vote
-    的响应体 —— 这样既能走站点已验证可用的路径, 又能拿到服务端真实的 json.error
-    (只读 DOM 的话, 失败原因会被吞掉, 曾经出现过"CI 显示绿色但其实没投票")。
-    """
-    before = server_info(page, slug)
-    if before is None:
-        return {"ok": False, "error": "无法读取服务器信息"}
-    h_before = (before.get("server") or {}).get("hours_remaining")
-
-    page.goto(f"{SITE}/servers/{slug}", wait_until="domcontentloaded", timeout=90000)
-    page.wait_for_selector("#sd-vote-btn:not([disabled])", timeout=60000)
-
-    if donate_cents:
-        return _do_donate(page, slug, donate_cents, h_before)
-
-    # 捕获 POST /vote 的真实响应（比读 DOM 可靠）
-    captured = []
-
-    def _on_response(resp):
-        try:
-            if "/vote" in resp.url and resp.request.method == "POST":
-                try:
-                    body = resp.text()
-                except Exception as e:
-                    body = f"<read fail {e}>"
-                captured.append({"status": resp.status, "body": body})
-        except Exception:
-            pass
-
-    page.on("response", _on_response)
-
-    try:
-        return _vote_via_ui(page, slug, voter_name, ad_watched, captured, h_before)
-    finally:
-        try:
-            page.remove_listener("response", _on_response)
-        except Exception:
-            pass
-
-
 def resp_text(captured):
     if not captured:
         return ""
@@ -404,10 +338,29 @@ def resp_text(captured):
     return body[:300]
 
 
-def _vote_via_ui(page, slug, voter_name, ad_watched, captured, h_before):
-    """在投票弹窗里走站点原生提交路径, 同时用 captured 里的网络响应判定成败。"""
+# ==================== 投票 / 捐赠 ====================
+def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"):
+    """走站点原生投票流程。返回 dict。
 
-    # 点投票按钮 -> 弹出 modal -> 渲染 Turnstile
+    策略:
+      1. 在 gaming4free.net 公开页拿到 Turnstile token;
+      2. 切到 control.gaming4free.net 同源上下文里发 POST —— 走跨域 POST 会被
+         Cloudflare 的 CORS 预检挡掉(浏览器报 "TypeError: Failed to fetch",
+         站点自己的 JS 也一样失败), 同源则必定能拿到服务端响应。
+      3. 判定成败用网络层捕获到的响应体, 能拿到服务端真实的 json.error
+         (只读 DOM 的话失败原因会被吞掉, 曾经出现"CI 绿色但其实没投票")。
+    """
+    before = server_info(page, slug)
+    if before is None:
+        return {"ok": False, "error": "无法读取服务器信息"}
+    h_before = (before.get("server") or {}).get("hours_remaining")
+
+    if donate_cents:
+        return _do_donate(page, slug, donate_cents, h_before)
+
+    # ---- 第一步: 公开页拿 Turnstile token ----
+    page.goto(f"{SITE}/servers/{slug}", wait_until="domcontentloaded", timeout=90000)
+    page.wait_for_selector("#sd-vote-btn:not([disabled])", timeout=60000)
     page.click("#sd-vote-btn")
     page.wait_for_timeout(2500)
 
@@ -425,56 +378,51 @@ def _vote_via_ui(page, slug, voter_name, ad_watched, captured, h_before):
         except Exception:
             pass
         return {"ok": False, "error": f"Turnstile 验证未通过（{TS_TIMEOUT}s 内没拿到 token）", "before": h_before}
+    log(f"  Turnstile token 已获取 (len={len(token)})")
 
-    # 优先走站点原生提交路径
-    if voter_name:
+    # ---- 第二步: 切到 control 域同源提交 ----
+    captured = []
+
+    def _on_response(resp):
         try:
-            page.fill("#vm-ign", voter_name)
+            if "/vote" in resp.url and resp.request.method == "POST":
+                try:
+                    body = resp.text()
+                except Exception as e:
+                    body = f"<read fail {e}>"
+                captured.append({"status": resp.status, "body": body})
         except Exception:
             pass
+
+    page.on("response", _on_response)
     try:
-        page.click("#vm-submit")
+        page.goto(f"{API}/login", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(800)
     except Exception as e:
-        captured.append({"status": None, "body": f"<click failed: {e}>"})
-
-    msg, cls = "", ""
-    for _ in range(30):
-        page.wait_for_timeout(700)
-        msg = page.evaluate("document.getElementById('vm-msg')?.textContent") or ""
-        cls = page.evaluate("document.getElementById('vm-msg')?.className") or ""
-        if captured or (msg and "Submitting" not in msg):
-            break
-
-    # 兜底: 站点按钮没发出请求(比如 vm-submit 仍是 disabled), 就用拿到的 token 自己发
-    if not captured and token:
-        log("  站点按钮未发出请求，改用 token 直接提交…")
-        log(f"  token 长度={len(token)} 前缀={token[:12]}…")
-        resp = _fetch_vote_response(page, slug, token, voter_name, ad_watched)
+        log(f"  打开 control 域失败: {str(e)[:120]}")
+    try:
+        resp = page.evaluate(
+            """async ([url, payload]) => {
+                try {
+                    const r = await fetch(url, {method:'POST',
+                        headers:{'Content-Type':'application/json','Accept':'application/json'},
+                        body: JSON.stringify(payload)});
+                    return {status: r.status, text: (await r.text()).slice(0, 500)};
+                } catch(e) { return {error: String(e)}; }
+            }""",
+            [f"/api/servers/{slug}/vote",
+             {"cf-turnstile-response": token, "voter_name": voter_name or None,
+              "ad_watched": ad_watched}])
         st = resp.get("status")
         body = resp.get("text") or ""
-        try:
-            j = resp.get("json") or {}
-        except Exception:
-            j = {}
         captured.append({"status": st, "body": body or f"<fetch error: {resp.get('error')}>"})
         if not st:
-            log(f"  直接提交失败: {resp.get('error')}")
-            # 再用站点自己的 fetch 逻辑试一次(带 Origin 头, 与站点完全一致)
-            alt = page.evaluate(
-                """async ([url, payload]) => {
-                    try {
-                        const r = await fetch(url, {method:'POST',
-                            headers:{'Content-Type':'application/json','Accept':'application/json'},
-                            body: JSON.stringify(payload)});
-                        return {status: r.status, text: (await r.text()).slice(0, 300)};
-                    } catch(e) { return {error: String(e)}; }
-                }""",
-                [f"{API}/api/servers/{slug}/vote",
-                 {"cf-turnstile-response": token, "voter_name": voter_name or None,
-                  "ad_watched": ad_watched}])
-            log(f"  带默认凭据重试: {json.dumps(alt, ensure_ascii=False)}")
-            if alt.get("status"):
-                captured[-1] = {"status": alt["status"], "body": alt.get("text") or ""}
+            log(f"  同源提交失败: {resp.get('error')}")
+    finally:
+        try:
+            page.remove_listener("response", _on_response)
+        except Exception:
+            pass
 
     data = {}
     status = None
@@ -485,24 +433,14 @@ def _vote_via_ui(page, slug, voter_name, ad_watched, captured, h_before):
             data = json.loads(raw)
         except Exception:
             data = {}
-    ok = bool(captured and status == 200 and data.get("success"))
-    if not captured:
-        # 网络层没抓到 -> 回退到 DOM 判定
-        ok = "ok" in (cls or "")
+    ok = bool(status == 200 and data.get("success"))
 
     after = server_info(page, slug) or {}
     h_after = (after.get("server") or {}).get("hours_remaining")
     reason = ""
     if not ok:
-        reason = (data.get("error") or data.get("message") or (msg or "").strip()
+        reason = (data.get("error") or data.get("message")
                   or resp_text(captured) or f"HTTP {status}")
-        # 网络层完全没抓到响应 -> 打印详细诊断, 定位是 CORS / 代理 / 网络层
-        if not captured:
-            try:
-                diag = _diag_fetch(page, f"{API}/api/servers/{slug}", {})
-                log(f"  诊断: {json.dumps(diag, ensure_ascii=False)}")
-            except Exception as e:
-                log(f"  诊断失败: {e}")
     return {
         "ok": ok,
         "slug": slug,
