@@ -63,6 +63,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import json
 
 # ==================== 本地 .env 加载(不提交仓库) ====================
 def _load_local_env():
@@ -315,9 +316,39 @@ def _fetch_vote_response(page, slug, token, voter_name, ad_watched="0"):
     )
 
 
+def _diag_fetch(page, url, payload):
+    """诊断 fetch 失败原因: 分别试 GET / POST, 看是 CORS、代理还是网络层问题。"""
+    return page.evaluate(
+        """async ([url, payload]) => {
+            const out = {};
+            try {
+                const g = await fetch(url, {headers:{'Accept':'application/json'}, credentials:'omit'});
+                out.get_status = g.status;
+                out.get_text = (await g.text()).slice(0, 200);
+            } catch(e) { out.get_error = String(e); }
+            try {
+                const p = await fetch(url, {method:'POST',
+                    headers:{'Content-Type':'application/json','Accept':'application/json'},
+                    credentials:'omit',
+                    body: JSON.stringify(payload)});
+                out.post_status = p.status;
+                out.post_text = (await p.text()).slice(0, 300);
+            } catch(e) { out.post_error = String(e); }
+            out.origin = location.origin;
+            return out;
+        }""",
+        [url, payload],
+    )
+
+
 # ==================== 投票 / 捐赠 ====================
 def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"):
-    """走站点原生投票流程。返回 dict。"""
+    """走站点原生投票流程。返回 dict。
+
+    策略: 用站点自己的按钮流程提交(#vm-submit), 同时在网络层捕获 POST /vote
+    的响应体 —— 这样既能走站点已验证可用的路径, 又能拿到服务端真实的 json.error
+    (只读 DOM 的话, 失败原因会被吞掉, 曾经出现过"CI 显示绿色但其实没投票")。
+    """
     before = server_info(page, slug)
     if before is None:
         return {"ok": False, "error": "无法读取服务器信息"}
@@ -328,6 +359,41 @@ def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"
 
     if donate_cents:
         return _do_donate(page, slug, donate_cents, h_before)
+
+    # 捕获 POST /vote 的真实响应（比读 DOM 可靠）
+    captured = []
+
+    def _on_response(resp):
+        try:
+            if "/vote" in resp.url and resp.request.method == "POST":
+                try:
+                    body = resp.text()
+                except Exception as e:
+                    body = f"<read fail {e}>"
+                captured.append({"status": resp.status, "body": body})
+        except Exception:
+            pass
+
+    page.on("response", _on_response)
+
+    try:
+        return _vote_via_ui(page, slug, voter_name, ad_watched, captured, h_before)
+    finally:
+        try:
+            page.remove_listener("response", _on_response)
+        except Exception:
+            pass
+
+
+def resp_text(captured):
+    if not captured:
+        return ""
+    body = (captured[-1].get("body") or "").strip()
+    return body[:300]
+
+
+def _vote_via_ui(page, slug, voter_name, ad_watched, captured, h_before):
+    """在投票弹窗里走站点原生提交路径, 同时用 captured 里的网络响应判定成败。"""
 
     # 点投票按钮 -> 弹出 modal -> 渲染 Turnstile
     page.click("#sd-vote-btn")
@@ -348,28 +414,84 @@ def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"
             pass
         return {"ok": False, "error": f"Turnstile 验证未通过（{TS_TIMEOUT}s 内没拿到 token）", "before": h_before}
 
-    # 拿到 token 后自己发 POST, 这样能拿到服务端真实错误(json.error), 而不是只看到 DOM 提示
-    resp = _fetch_vote_response(page, slug, token, voter_name, ad_watched)
-    data = resp.get("json") or {}
-    ok = bool(resp.get("status") == 200 and data.get("success"))
+    # 优先走站点原生提交路径
+    if voter_name:
+        try:
+            page.fill("#vm-ign", voter_name)
+        except Exception:
+            pass
+    try:
+        page.click("#vm-submit")
+    except Exception as e:
+        captured.append({"status": None, "body": f"<click failed: {e}>"})
+
+    msg, cls = "", ""
+    for _ in range(30):
+        page.wait_for_timeout(700)
+        msg = page.evaluate("document.getElementById('vm-msg')?.textContent") or ""
+        cls = page.evaluate("document.getElementById('vm-msg')?.className") or ""
+        if captured or (msg and "Submitting" not in msg):
+            break
+
+    # 兜底: 站点按钮没发出请求(比如 vm-submit 仍是 disabled), 就用拿到的 token 自己发
+    if not captured and token:
+        log("  站点按钮未发出请求，改用 token 直接提交…")
+        resp = _fetch_vote_response(page, slug, token, voter_name, ad_watched)
+        st = resp.get("status")
+        body = resp.get("text") or ""
+        try:
+            j = resp.get("json") or {}
+        except Exception:
+            j = {}
+        captured.append({"status": st, "body": body or f"<fetch error: {resp.get('error')}>"})
+        if not st:
+            log(f"  直接提交失败: {resp.get('error')}")
+
+    data = {}
+    status = None
+    if captured:
+        status = captured[-1].get("status")
+        raw = captured[-1].get("body") or ""
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+    ok = bool(captured and status == 200 and data.get("success"))
+    if not captured:
+        # 网络层没抓到 -> 回退到 DOM 判定
+        ok = "ok" in (cls or "")
 
     after = server_info(page, slug) or {}
     h_after = (after.get("server") or {}).get("hours_remaining")
     reason = ""
     if not ok:
-        reason = (data.get("error") or data.get("message")
-                  or resp.get("text") or f"HTTP {resp.get('status')}")
+        reason = (data.get("error") or data.get("message") or (msg or "").strip()
+                  or resp_text(captured) or f"HTTP {status}")
+        # 网络层完全没抓到响应 -> 打印详细诊断, 定位是 CORS / 代理 / 网络层
+        if not captured:
+            try:
+                diag = _diag_fetch(page, f"{API}/api/servers/{slug}", {})
+                log(f"  诊断: {json.dumps(diag, ensure_ascii=False)}")
+            except Exception as e:
+                log(f"  诊断失败: {e}")
     return {
         "ok": ok,
         "slug": slug,
-        "message": data.get("message") or "",
+        "message": data.get("message") or (msg or "").strip(),
         "error": "" if ok else reason,
         "before": h_before,
         "after": h_after,
         "delta": round(h_after - h_before, 2) if (h_before is not None and h_after is not None) else None,
         "cooldown": after.get("cooldown"),
-        "http_status": resp.get("status"),
+        "http_status": status,
     }
+
+
+def resp_text(captured):
+    if not captured:
+        return ""
+    body = (captured[-1].get("body") or "").strip()
+    return body[:300]
 
 
 def _do_donate(page, slug, cents, h_before):
