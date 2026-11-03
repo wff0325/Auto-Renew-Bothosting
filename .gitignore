@@ -1,0 +1,14 @@
+# 本地凭证（勿提交）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 失败现场截图 / 日志
+*.png
+*.log
+g4f_*.json
