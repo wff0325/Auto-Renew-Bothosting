@@ -317,14 +317,16 @@ def _fetch_vote_response(page, slug, token, voter_name, ad_watched="0"):
 
 
 def _diag_fetch(page, url, payload):
-    """诊断 fetch 失败原因: 分别试 GET / POST, 看是 CORS、代理还是网络层问题。"""
+    """诊断 fetch 失败原因: 分别试 GET / POST / 预检, 看是 CORS、代理还是网络层问题。"""
     return page.evaluate(
         """async ([url, payload]) => {
             const out = {};
+            out.origin = location.origin;
+            out.href = location.href;
             try {
                 const g = await fetch(url, {headers:{'Accept':'application/json'}, credentials:'omit'});
                 out.get_status = g.status;
-                out.get_text = (await g.text()).slice(0, 200);
+                out.get_text = (await g.text()).slice(0, 120);
             } catch(e) { out.get_error = String(e); }
             try {
                 const p = await fetch(url, {method:'POST',
@@ -332,9 +334,19 @@ def _diag_fetch(page, url, payload):
                     credentials:'omit',
                     body: JSON.stringify(payload)});
                 out.post_status = p.status;
-                out.post_text = (await p.text()).slice(0, 300);
+                out.post_text = (await p.text()).slice(0, 200);
             } catch(e) { out.post_error = String(e); }
-            out.origin = location.origin;
+            try {
+                const r = await fetch(url, {method:'OPTIONS',
+                    headers:{'Origin': location.origin,
+                             'Access-Control-Request-Method':'POST',
+                             'Access-Control-Request-Headers':'content-type'}});
+                out.options_status = r.status;
+                const hh = {};
+                r.headers.forEach((v,k)=>{ hh[k]=v; });
+                out.options_headers = hh;
+                await r.text();
+            } catch(e) { out.options_status = 'ERR ' + String(e); }
             return out;
         }""",
         [url, payload],
@@ -436,6 +448,7 @@ def _vote_via_ui(page, slug, voter_name, ad_watched, captured, h_before):
     # 兜底: 站点按钮没发出请求(比如 vm-submit 仍是 disabled), 就用拿到的 token 自己发
     if not captured and token:
         log("  站点按钮未发出请求，改用 token 直接提交…")
+        log(f"  token 长度={len(token)} 前缀={token[:12]}…")
         resp = _fetch_vote_response(page, slug, token, voter_name, ad_watched)
         st = resp.get("status")
         body = resp.get("text") or ""
@@ -446,6 +459,22 @@ def _vote_via_ui(page, slug, voter_name, ad_watched, captured, h_before):
         captured.append({"status": st, "body": body or f"<fetch error: {resp.get('error')}>"})
         if not st:
             log(f"  直接提交失败: {resp.get('error')}")
+            # 再用站点自己的 fetch 逻辑试一次(带 Origin 头, 与站点完全一致)
+            alt = page.evaluate(
+                """async ([url, payload]) => {
+                    try {
+                        const r = await fetch(url, {method:'POST',
+                            headers:{'Content-Type':'application/json','Accept':'application/json'},
+                            body: JSON.stringify(payload)});
+                        return {status: r.status, text: (await r.text()).slice(0, 300)};
+                    } catch(e) { return {error: String(e)}; }
+                }""",
+                [f"{API}/api/servers/{slug}/vote",
+                 {"cf-turnstile-response": token, "voter_name": voter_name or None,
+                  "ad_watched": ad_watched}])
+            log(f"  带默认凭据重试: {json.dumps(alt, ensure_ascii=False)}")
+            if alt.get("status"):
+                captured[-1] = {"status": alt["status"], "body": alt.get("text") or ""}
 
     data = {}
     status = None
