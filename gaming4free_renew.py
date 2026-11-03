@@ -338,6 +338,21 @@ def resp_text(captured):
     return body[:300]
 
 
+def _describe_body(status, body):
+    """把非 JSON 的响应体翻译成人话（多半是 Cloudflare 拦截页）。"""
+    b = (body or "").strip()
+    if not b:
+        return f"HTTP {status}（空响应体）"
+    if b.startswith("<!DOCTYPE html") or b.startswith("<html"):
+        low = b.lower()
+        if "attention required" in low:
+            return f"HTTP {status}：Cloudflare WAF 拦截页（Attention Required）"
+        if "challenge" in low or "cf-mitigated" in low:
+            return f"HTTP {status}：Cloudflare 托管挑战页（该出口 IP 被要求过人机验证）"
+        return f"HTTP {status}：返回了 HTML 页面而非 JSON"
+    return f"HTTP {status}：{b[:200]}"
+
+
 # ==================== 投票 / 捐赠 ====================
 def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"):
     """走站点原生投票流程。返回 dict。
@@ -400,8 +415,12 @@ def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"
         page.wait_for_timeout(800)
     except Exception as e:
         log(f"  打开 control 域失败: {str(e)[:120]}")
-    try:
-        resp = page.evaluate(
+
+    payload = {"cf-turnstile-response": token, "voter_name": voter_name or None,
+               "ad_watched": ad_watched}
+
+    def _submit():
+        return page.evaluate(
             """async ([url, payload]) => {
                 try {
                     const r = await fetch(url, {method:'POST',
@@ -410,14 +429,37 @@ def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"
                     return {status: r.status, text: (await r.text()).slice(0, 500)};
                 } catch(e) { return {error: String(e)}; }
             }""",
-            [f"/api/servers/{slug}/vote",
-             {"cf-turnstile-response": token, "voter_name": voter_name or None,
-              "ad_watched": ad_watched}])
+            [f"/api/servers/{slug}/vote", payload])
+
+    try:
+        resp = _submit()
         st = resp.get("status")
         body = resp.get("text") or ""
         captured.append({"status": st, "body": body or f"<fetch error: {resp.get('error')}>"})
         if not st:
             log(f"  同源提交失败: {resp.get('error')}")
+
+        # Cloudflare 托管挑战：返回 HTML 挑战页时, 让浏览器自己去过一遍挑战
+        # (导航到受保护页面 -> Chrome 自动解 -> 拿到 clearance cookie), 再重试提交。
+        if st and body.strip().lower().startswith("<!doctype html"):
+            log("  命中 Cloudflare 托管挑战，让浏览器自动过挑战后重试…")
+            for _ in range(3):
+                try:
+                    page.goto(f"{API}/api/servers/{slug}", wait_until="domcontentloaded",
+                              timeout=60000)
+                    page.wait_for_timeout(4000)
+                except Exception:
+                    pass
+                # 挑战页里如果有 Turnstile 复选框, 点掉
+                wait_turnstile_token(page, timeout=40)
+                resp = _submit()
+                st = resp.get("status")
+                body = resp.get("text") or ""
+                captured.append({"status": st, "body": body or f"<fetch error: {resp.get('error')}>"})
+                if st and not body.strip().lower().startswith("<!doctype html"):
+                    break
+                if not st:
+                    break
     finally:
         try:
             page.remove_listener("response", _on_response)
@@ -426,11 +468,14 @@ def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"
 
     data = {}
     status = None
-    if captured:
-        status = captured[-1].get("status")
-        raw = captured[-1].get("body") or ""
+    raw_body = ""
+    # 优先用最后一次 evaluate 的结果; 网络监听器捕获的作为兜底
+    last = captured[-1] if captured else None
+    if last:
+        status = last.get("status")
+        raw_body = last.get("body") or ""
         try:
-            data = json.loads(raw)
+            data = json.loads(raw_body)
         except Exception:
             data = {}
     ok = bool(status == 200 and data.get("success"))
@@ -440,7 +485,7 @@ def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"
     reason = ""
     if not ok:
         reason = (data.get("error") or data.get("message")
-                  or resp_text(captured) or f"HTTP {status}")
+                  or _describe_body(status, raw_body))
     return {
         "ok": ok,
         "slug": slug,
@@ -452,13 +497,6 @@ def do_vote(page, slug, voter_name=VOTER_NAME, donate_cents=None, ad_watched="0"
         "cooldown": after.get("cooldown"),
         "http_status": status,
     }
-
-
-def resp_text(captured):
-    if not captured:
-        return ""
-    body = (captured[-1].get("body") or "").strip()
-    return body[:300]
 
 
 def _do_donate(page, slug, cents, h_before):
