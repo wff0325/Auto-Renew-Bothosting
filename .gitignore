@@ -30,3 +30,4 @@ _dumpjs.py
 _local_test*.txt
 _inline.js
 _*_out.txt
+_corsdiag.py
